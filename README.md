@@ -1,5 +1,10 @@
 # DLB — Dead Letter Box
 
+[![PyPI](https://img.shields.io/pypi/v/dlb-mcp.svg)](https://pypi.org/project/dlb-mcp/)
+[![CI](https://github.com/jordanspilgrim/dlb-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/jordanspilgrim/dlb-mcp/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/pypi/pyversions/dlb-mcp.svg)](https://pypi.org/project/dlb-mcp/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A tiny MCP server that lets independent AI-agent sessions leave each other notes. Fire-and-forget. Queued for non-existent recipients. No daemon. Six tools.
 
 ## Why
@@ -18,14 +23,16 @@ DLB does one thing: messages between agent sessions. It does NOT do orchestratio
 
 ## Install
 
-```bash
-uv tool install dlb-mcp
-```
-
-Or zero-install:
+Zero-install (recommended — uvx fetches and runs on demand):
 
 ```bash
 uvx dlb-mcp
+```
+
+Or install once:
+
+```bash
+uv tool install dlb-mcp
 ```
 
 ## Wire into Claude Code
