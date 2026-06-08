@@ -266,9 +266,7 @@ def register(name: str, working_on: str | None = None, *, force: bool = False) -
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            existing = conn.execute(
-                "SELECT name FROM agents WHERE name = ?", (name,)
-            ).fetchone()
+            existing = conn.execute("SELECT name FROM agents WHERE name = ?", (name,)).fetchone()
 
             if existing and not force:
                 suggestions = _suggest_alternatives(conn, name)
