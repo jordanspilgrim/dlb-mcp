@@ -78,8 +78,16 @@ def test_register_conflict_raises_with_suggestions() -> None:
 
 
 def test_register_with_force_evicts_prior_session() -> None:
+    """Legitimate handoff: caller has the prior token, so force=True
+    bypasses the stale-gate. Casual hijack (without the token, against
+    an active holder) is covered in test_security_correctness.py."""
     r1 = store.register("alpha")
-    r2 = store.register("alpha", working_on="taking over", force=True)
+    r2 = store.register(
+        "alpha",
+        working_on="taking over",
+        force=True,
+        prior_token=r1["session_token"],
+    )
     assert r2["session_token"] != r1["session_token"]
     # Old token must no longer authenticate
     with pytest.raises(AuthError):
@@ -243,15 +251,17 @@ def test_list_threads_returns_unread_counts_and_staleness() -> None:
 def test_list_threads_marks_stale_when_last_seen_outside_window() -> None:
     """An agent inactive longer than active_within is flagged stale."""
     store.register("oldtimer")
-    # Manually backdate last_seen to a week ago
+    # Manually backdate last_seen_ms to a week ago (v2 schema uses
+    # INTEGER ms, not the v1 TEXT column).
     import sqlite3
 
     from dlb_mcp.store import store_path
 
+    week_ago_ms = int((datetime.now(UTC) - timedelta(days=7)).timestamp() * 1000)
     conn = sqlite3.connect(str(store_path()))
     conn.execute(
-        "UPDATE agents SET last_seen = ? WHERE name = ?",
-        ((datetime.now(UTC) - timedelta(days=7)).isoformat(), "oldtimer"),
+        "UPDATE agents SET last_seen_ms = ? WHERE name = ?",
+        (week_ago_ms, "oldtimer"),
     )
     conn.commit()
     conn.close()
