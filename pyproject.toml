@@ -1,7 +1,7 @@
 [project]
 name = "dlb-mcp"
-version = "0.1.0"
-description = "Dead Letter Box: a tiny MCP server for independent agent sessions to leave each other notes. Six tools, no daemon, real dead-letter semantics."
+version = "0.2.0"
+description = "Dead Letter Box: a tiny MCP server for independent agent sessions to leave each other notes. Six tools, no daemon, real dead-letter semantics. Includes dlb-monitor for push-like wake via Claude Code's Monitor tool."
 readme = "README.md"
 authors = [{ name = "Jordan S Pilgrim" }]
 license = { text = "MIT" }
@@ -17,6 +17,7 @@ Issues = "https://github.com/jordanspilgrim/dlb-mcp/issues"
 
 [project.scripts]
 dlb-mcp = "dlb_mcp.__main__:main"
+dlb-monitor = "dlb_mcp.monitor:main"
 
 [build-system]
 requires = ["hatchling"]
