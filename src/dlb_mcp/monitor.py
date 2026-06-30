@@ -49,6 +49,12 @@ from . import store
 
 DEFAULT_INTERVAL_SECONDS = 2.0
 DEFAULT_BODY_PREVIEW_LEN = 80
+# How long to back off after an unexpected (non-sqlite, non-KeyboardInterrupt)
+# error in the poll loop. We can't distinguish "transient I/O hiccup" from
+# "broken environment", so the backoff is a balance — long enough to avoid a
+# tight crashloop, short enough that the user notices things are wrong within
+# a reasonable window.
+LOOP_ERROR_BACKOFF_SECONDS = 5.0
 
 
 def _format_event(
@@ -118,13 +124,48 @@ def _fetch_new(
         return []
 
 
+def _poll_iteration(
+    db_path: Path,
+    name: str,
+    seen_max_id: int,
+    include_senders: set[str] | None,
+    exclude_senders: set[str] | None,
+) -> int:
+    """One polling tick. Returns the updated watermark.
+
+    Extracted from run() so the loop body is unit-testable in isolation
+    and the outer loop can wrap it with crash-resilience without ballooning
+    in size.
+    """
+    new_msgs = _fetch_new(db_path, name, seen_max_id)
+    for msg_id, sent_ms, sender, subject, body in new_msgs:
+        filtered = (include_senders is not None and sender not in include_senders) or (
+            exclude_senders is not None and sender in exclude_senders
+        )
+        if not filtered:
+            line = _format_event(sent_ms, sender, subject, body)
+            print(line, flush=True)
+        # Always advance watermark — filtered messages still happened.
+        seen_max_id = max(seen_max_id, msg_id)
+    return seen_max_id
+
+
 def run(
     name: str,
     interval_seconds: float,
     include_senders: set[str] | None,
     exclude_senders: set[str] | None,
 ) -> int:
-    """Main poll loop. Returns exit code (0 on clean Ctrl-C)."""
+    """Main poll loop. Returns exit code (0 on clean Ctrl-C).
+
+    Resilience contract: the loop MUST NOT die on a transient error.
+    `_fetch_new` already swallows `sqlite3.Error` and returns []. This
+    outer try/except catches anything else — OSError on stdout, encoding
+    bugs, memory blips, third-party-side weirdness — logs it to stderr,
+    backs off, and resumes. The only paths out are KeyboardInterrupt
+    (Ctrl-C → exit 0) and a real process-kill (SIGKILL → uncatchable; the
+    Monitor tool reports the exit code so the LLM can re-launch).
+    """
     db_path = store.store_path()
     # init_schema runs migration on a legacy v1 DB so we can read *_ms
     # safely. Safe to call here — it's idempotent.
@@ -144,17 +185,28 @@ def run(
 
     try:
         while True:
-            new_msgs = _fetch_new(db_path, name, seen_max_id)
-            for msg_id, sent_ms, sender, subject, body in new_msgs:
-                filtered = (include_senders is not None and sender not in include_senders) or (
-                    exclude_senders is not None and sender in exclude_senders
+            try:
+                seen_max_id = _poll_iteration(
+                    db_path, name, seen_max_id, include_senders, exclude_senders
                 )
-                if not filtered:
-                    line = _format_event(sent_ms, sender, subject, body)
-                    print(line, flush=True)
-                # Always advance watermark — filtered messages still happened.
-                seen_max_id = max(seen_max_id, msg_id)
-            time.sleep(interval_seconds)
+                time.sleep(interval_seconds)
+            except KeyboardInterrupt:
+                raise  # forwarded to the outer handler for clean exit
+            except Exception as e:
+                # Hard guarantee: a non-fatal error in one iteration must not
+                # take down the wake source. Log loud enough that the user
+                # notices (this stderr line goes to the Monitor task's
+                # output file but NOT to the conversation as a notification —
+                # which is the right asymmetry: we want the loop to keep
+                # running silently in normal failure, not to spam every
+                # transient hiccup into the LLM's context).
+                print(
+                    f"dlb-monitor: warning: poll iteration failed "
+                    f"({type(e).__name__}: {e}); backing off "
+                    f"{LOOP_ERROR_BACKOFF_SECONDS}s and continuing",
+                    file=sys.stderr,
+                )
+                time.sleep(LOOP_ERROR_BACKOFF_SECONDS)
     except KeyboardInterrupt:
         print("dlb-monitor: stopping (KeyboardInterrupt)", file=sys.stderr)
         return 0

@@ -223,3 +223,104 @@ def test_main_rejects_nonpositive_interval(
         monitor.main(["--name", "alpha", "--interval", "0"])
     err = capsys.readouterr().err
     assert "positive" in err
+
+
+# ── Resilience: the loop must survive non-fatal exceptions ──────────────────
+
+
+def test_poll_iteration_advances_watermark_for_new_messages(
+    isolated_store: Path,
+) -> None:
+    """_poll_iteration is the unit of work; verify its watermark contract
+    independently of the loop wrapper."""
+    store.register("alpha")
+    store.send(to="alpha", body="m1", from_="bob")
+    store.send(to="alpha", body="m2", from_="bob")
+    new_watermark = monitor._poll_iteration(
+        isolated_store, "alpha", 0, include_senders=None, exclude_senders=None
+    )
+    assert new_watermark == 2
+
+
+def test_poll_iteration_returns_unchanged_watermark_for_empty_inbox(
+    isolated_store: Path,
+) -> None:
+    store.register("alpha")
+    new_watermark = monitor._poll_iteration(
+        isolated_store, "alpha", 7, include_senders=None, exclude_senders=None
+    )
+    # No messages → watermark unchanged (NOT reset to 0)
+    assert new_watermark == 7
+
+
+def test_run_loop_survives_unexpected_exception_in_poll_iteration(
+    isolated_store: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The whole point of v0.2.1. A RuntimeError out of _poll_iteration
+    must NOT kill the loop — must log, back off, and continue. We force
+    one failing iteration then a normal one then a KeyboardInterrupt to
+    exit cleanly, and assert the loop reached the third call (proving it
+    didn't die on the RuntimeError)."""
+    store.register("alpha")
+
+    calls: list[str] = []
+
+    def flaky_iteration(*_args, **_kwargs) -> int:
+        if not calls:
+            calls.append("boom")
+            raise RuntimeError("simulated transient failure")
+        if len(calls) == 1:
+            calls.append("ok")
+            return 0
+        # Third call → request clean exit
+        calls.append("kbd")
+        raise KeyboardInterrupt
+
+    # Also collapse the backoff sleep so the test isn't slow
+    monkeypatch.setattr(monitor, "_poll_iteration", flaky_iteration)
+    monkeypatch.setattr(monitor, "LOOP_ERROR_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(monitor.time, "sleep", lambda *_: None)
+
+    exit_code = monitor.run(
+        name="alpha",
+        interval_seconds=0.01,
+        include_senders=None,
+        exclude_senders=None,
+    )
+
+    assert exit_code == 0
+    # Critical assertion: the third call happened. If the loop died on the
+    # first RuntimeError, calls would be just ["boom"].
+    assert calls == ["boom", "ok", "kbd"]
+
+    err = capsys.readouterr().err
+    # The warning line about the failure must appear in stderr so users
+    # debugging a flaky monitor can see what's going wrong.
+    assert "poll iteration failed" in err
+    assert "RuntimeError" in err
+    assert "simulated transient failure" in err
+
+
+def test_run_loop_propagates_keyboard_interrupt_cleanly(
+    isolated_store: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The outer except RuntimeError handler must NOT swallow
+    KeyboardInterrupt — Ctrl-C should still exit the process cleanly."""
+    store.register("alpha")
+
+    def immediate_ctrl_c(*_args, **_kwargs) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(monitor, "_poll_iteration", immediate_ctrl_c)
+    monkeypatch.setattr(monitor.time, "sleep", lambda *_: None)
+
+    exit_code = monitor.run(
+        name="alpha",
+        interval_seconds=0.01,
+        include_senders=None,
+        exclude_senders=None,
+    )
+    assert exit_code == 0
