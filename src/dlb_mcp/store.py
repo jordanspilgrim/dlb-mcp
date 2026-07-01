@@ -42,7 +42,7 @@ DEFAULT_TTL_DAYS = 7
 DEFAULT_MAX_BODY_BYTES = 256 * 1024  # 256 KiB
 DEFAULT_TAKEOVER_AFTER_SECONDS = 24 * 60 * 60  # 24h: matches list_threads' default stale window
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def store_path() -> Path:
@@ -104,6 +104,12 @@ class Message:
     sent_at: datetime
     read_at: datetime | None
     expires_at: datetime
+    # v3 lifecycle fields (all optional/None on legacy rows)
+    msg_type: str | None = None  # advisory tag from sender; convention: "task"
+    in_reply_to: int | None = None  # references messages.id — sender-set
+    status: str | None = None  # recipient-set; convention: queued/accepted/running/done/blocked
+    status_note: str | None = None  # recipient-set free-text detail on status
+    status_updated_at: datetime | None = None
 
 
 # ── Connection management ────────────────────────────────────────────────────
@@ -160,7 +166,7 @@ def _connect() -> Iterator[sqlite3.Connection]:
 
 
 def init_schema() -> None:
-    """Create tables if missing; migrate v1→v2 if needed. Idempotent."""
+    """Create tables if missing; migrate through v1→v2→v3 as needed. Idempotent."""
     with _connect() as conn:
         current_version = conn.execute("PRAGMA user_version").fetchone()[0]
 
@@ -173,21 +179,26 @@ def init_schema() -> None:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='agents'"
             ).fetchone()
             if row is None:
-                # Truly fresh — create v2 schema directly.
-                _create_v2_schema(conn)
+                # Truly fresh — create current schema directly.
+                _create_current_schema(conn)
             else:
-                # Legacy v1 DB without a user_version stamp. Migrate.
+                # Legacy v1 DB without a user_version stamp. Migrate through v2 → v3.
                 _migrate_v1_to_v2(conn)
+                _migrate_v2_to_v3(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif current_version == 1:
             _migrate_v1_to_v2(conn)
+            _migrate_v2_to_v3(conn)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        elif current_version == 2:
+            _migrate_v2_to_v3(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
-def _create_v2_schema(conn: sqlite3.Connection) -> None:
-    """Create v2 tables + index. Uses individual execute() calls (NOT
-    executescript) because executescript disregards isolation_level and
-    commits mid-script — which would close a caller's outer transaction
+def _create_current_schema(conn: sqlite3.Connection) -> None:
+    """Create v3 (current) tables + index. Uses individual execute() calls
+    (NOT executescript) because executescript disregards isolation_level
+    and commits mid-script — which would close a caller's outer transaction
     when this is invoked from inside `_migrate_v1_to_v2`."""
     conn.execute(
         """
@@ -203,14 +214,19 @@ def _create_v2_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS messages (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            recipient_name  TEXT NOT NULL,
-            sender_name     TEXT NOT NULL,
-            subject         TEXT,
-            body            TEXT NOT NULL,
-            sent_at_ms      INTEGER NOT NULL,
-            read_at_ms      INTEGER,
-            expires_at_ms   INTEGER NOT NULL
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipient_name        TEXT NOT NULL,
+            sender_name           TEXT NOT NULL,
+            subject               TEXT,
+            body                  TEXT NOT NULL,
+            sent_at_ms            INTEGER NOT NULL,
+            read_at_ms            INTEGER,
+            expires_at_ms         INTEGER NOT NULL,
+            msg_type              TEXT,
+            in_reply_to           INTEGER,
+            status                TEXT,
+            status_note           TEXT,
+            status_updated_at_ms  INTEGER
         )
         """
     )
@@ -218,6 +234,29 @@ def _create_v2_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_messages_recipient "
         "ON messages(recipient_name, read_at_ms, sent_at_ms DESC)"
     )
+
+
+# Kept for backward-compat naming — some tests may reference _create_v2_schema
+_create_v2_schema = _create_current_schema
+
+
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    """Additive v2 → v3 migration: add 5 nullable columns to messages for
+    the task-lifecycle convention. All columns nullable → no rebuild
+    needed (unlike v1→v2 which had NOT NULL landmines).
+
+    Idempotent: guards each ADD COLUMN with a table_info probe.
+    """
+    existing_msg_cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
+    for col_name, col_type in [
+        ("msg_type", "TEXT"),
+        ("in_reply_to", "INTEGER"),
+        ("status", "TEXT"),
+        ("status_note", "TEXT"),
+        ("status_updated_at_ms", "INTEGER"),
+    ]:
+        if col_name not in existing_msg_cols:
+            conn.execute(f"ALTER TABLE messages ADD COLUMN {col_name} {col_type}")
 
 
 def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
@@ -343,6 +382,9 @@ def _iso_to_ms(s: str | None) -> int | None:
 
 
 def _row_to_message(r: sqlite3.Row) -> Message:
+    # Use dict-style .keys() check so we tolerate rows from pre-v3 test DBs
+    # or partial column sets in edge cases (SELECT specific cols).
+    keys = r.keys() if hasattr(r, "keys") else []
     return Message(
         id=r["id"],
         recipient_name=r["recipient_name"],
@@ -352,6 +394,13 @@ def _row_to_message(r: sqlite3.Row) -> Message:
         sent_at=_ms_to_dt(r["sent_at_ms"]),  # type: ignore[arg-type]
         read_at=_ms_to_dt(r["read_at_ms"]),
         expires_at=_ms_to_dt(r["expires_at_ms"]),  # type: ignore[arg-type]
+        msg_type=r["msg_type"] if "msg_type" in keys else None,
+        in_reply_to=r["in_reply_to"] if "in_reply_to" in keys else None,
+        status=r["status"] if "status" in keys else None,
+        status_note=r["status_note"] if "status_note" in keys else None,
+        status_updated_at=(
+            _ms_to_dt(r["status_updated_at_ms"]) if "status_updated_at_ms" in keys else None
+        ),
     )
 
 
@@ -583,6 +632,8 @@ def send(
     from_: str | None = None,
     *,
     session_token: str | None = None,
+    msg_type: str | None = None,
+    in_reply_to: int | None = None,
 ) -> Message:
     """Drop a message in `to`'s inbox.
 
@@ -604,6 +655,16 @@ def send(
     Size cap:
     - body bytes (UTF-8 encoded) must be <= DLB_MAX_BODY_BYTES (default 256KiB).
       Rejects with DLBError on overflow.
+
+    Lifecycle hints (v0.3.0+):
+    - msg_type: advisory tag. Convention: `"task"` signals to the recipient
+      that this message expects action + acknowledgment. DLB does not enforce
+      any type-based behavior — enforcement is at the client (CLAUDE.md
+      protocol level).
+    - in_reply_to: id of a message this one is replying to. Enables the
+      sender to correlate task acknowledgments and status updates back to
+      the original task. Soft reference — not a foreign key; a stale id
+      is stored as-is.
     """
     init_schema()
     if not to or not isinstance(to, str):
@@ -649,8 +710,9 @@ def send(
 
             cur = conn.execute(
                 "INSERT INTO messages (recipient_name, sender_name, subject, body, "
-                "sent_at_ms, read_at_ms, expires_at_ms) VALUES (?, ?, ?, ?, ?, NULL, ?)",
-                (to, sender, subject, body, sent_ms, expires_ms),
+                "sent_at_ms, read_at_ms, expires_at_ms, msg_type, in_reply_to) "
+                "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                (to, sender, subject, body, sent_ms, expires_ms, msg_type, in_reply_to),
             )
             msg_id = cur.lastrowid
             conn.execute("COMMIT")
@@ -668,7 +730,122 @@ def send(
         sent_at=_ms_to_dt(sent_ms),  # type: ignore[arg-type]
         read_at=None,
         expires_at=_ms_to_dt(expires_ms),  # type: ignore[arg-type]
+        msg_type=msg_type,
+        in_reply_to=in_reply_to,
     )
+
+
+def update_status(
+    message_id: int,
+    status: str,
+    session_token: str,
+    note: str | None = None,
+) -> Message:
+    """Update the lifecycle status of a message (v0.3.0+).
+
+    Called by the RECIPIENT of a message to signal progress back to the
+    sender. Convention (not enforced): status ∈ {"queued", "accepted",
+    "running", "done", "blocked"}. DLB stores whatever string you pass;
+    schema does not constrain the value so future conventions can extend
+    without a migration.
+
+    Auth: session_token must match the message's recipient (they're the
+    one running the task). If the recipient is unregistered, status
+    updates are rejected — there's no owner to authenticate as.
+
+    Side effect: sets read_at_ms if not already set (a status update
+    implies you've read the message). Deprecates the read/ack distinction
+    tentatively reserved in v1 — update_status IS the future of ack.
+
+    Returns the updated Message so the caller can echo it back to the
+    sender if desired.
+    """
+    init_schema()
+    if not status or not isinstance(status, str):
+        raise DLBError("status must be a non-empty string")
+
+    now_ms = _now_ms()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            msg_row = conn.execute(
+                "SELECT recipient_name, read_at_ms FROM messages WHERE id = ?",
+                (message_id,),
+            ).fetchone()
+            if msg_row is None:
+                conn.execute("ROLLBACK")
+                raise DLBError(f"No message with id={message_id}")
+
+            agent = conn.execute(
+                "SELECT session_token FROM agents WHERE name = ?",
+                (msg_row["recipient_name"],),
+            ).fetchone()
+            if agent is None:
+                conn.execute("ROLLBACK")
+                raise AuthError(
+                    f"Cannot update_status for unregistered recipient "
+                    f"'{msg_row['recipient_name']}'."
+                )
+            if session_token != agent["session_token"]:
+                conn.execute("ROLLBACK")
+                raise AuthError("Invalid session_token for this message's recipient.")
+
+            # Set read_at_ms if it was still NULL (status update implies read)
+            new_read_at_ms = msg_row["read_at_ms"] or now_ms
+            conn.execute(
+                "UPDATE messages SET status = ?, status_note = ?, "
+                "status_updated_at_ms = ?, read_at_ms = ? WHERE id = ?",
+                (status, note, now_ms, new_read_at_ms, message_id),
+            )
+
+            # Return the fully-hydrated row
+            row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+            conn.execute("COMMIT")
+        except Exception:
+            with suppress(sqlite3.OperationalError):
+                conn.execute("ROLLBACK")
+            raise
+
+    return _row_to_message(row)
+
+
+def get_task_status(message_id: int) -> dict | None:
+    """Return the lifecycle status of a message without reading it (v0.3.0+).
+
+    No auth required — DLB's trust model is coordination between cooperating
+    agents under the same OS user, and knowing "did my task get picked up?"
+    is exactly the kind of query a sender needs to make against a recipient's
+    inbox without holding the recipient's token.
+
+    Returns None if the message id doesn't exist. Otherwise a dict with
+    the id, msg_type, status, status_note, status_updated_at (ISO),
+    read_at (ISO if read, else None), and in_reply_to fields. Body/subject
+    are NOT returned — this is a lightweight status probe, not a content
+    read.
+    """
+    init_schema()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT id, msg_type, in_reply_to, status, status_note, "
+            "status_updated_at_ms, read_at_ms, recipient_name, sender_name "
+            "FROM messages WHERE id = ?",
+            (message_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    read_at = _ms_to_dt(row["read_at_ms"])
+    status_updated_at = _ms_to_dt(row["status_updated_at_ms"])
+    return {
+        "id": row["id"],
+        "recipient_name": row["recipient_name"],
+        "sender_name": row["sender_name"],
+        "msg_type": row["msg_type"],
+        "in_reply_to": row["in_reply_to"],
+        "status": row["status"],
+        "status_note": row["status_note"],
+        "status_updated_at": status_updated_at.isoformat() if status_updated_at else None,
+        "read_at": read_at.isoformat() if read_at else None,
+    }
 
 
 def read(

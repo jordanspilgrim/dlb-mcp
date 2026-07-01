@@ -19,11 +19,16 @@ from . import store
 mcp = FastMCP(
     name="dlb",
     instructions=(
-        "DLB — Dead Letter Box. Six tools for inter-agent messaging:\n"
-        "  register, list_threads, send, read, ack, unregister.\n"
+        "DLB — Dead Letter Box. Eight tools for inter-agent messaging + task lifecycle:\n"
+        "  register, list_threads, send, read, ack, unregister,\n"
+        "  update_status, get_task_status.\n"
         "Send is open (no auth); pass session_token on send to bind from_ to "
-        "your registered name (otherwise from_ is unverified free text).\n"
-        "Read/ack/unregister on a registered name require its session_token.\n"
+        "your registered name (otherwise from_ is unverified free text). "
+        "Task-shaped messages: pass msg_type='task' + optional in_reply_to when "
+        "sending a task; the recipient's protocol requires an immediate reply "
+        "acknowledging receipt (see ~/.claude/CLAUDE.md DLB Inbox Protocol).\n"
+        "Read/ack/unregister/update_status on a registered name require its "
+        "session_token. get_task_status is auth-free (sender-side probe).\n"
         "Sends to nonexistent recipients are queued and delivered on later "
         "registration.\n"
         "Trust boundary: session_token gates the tool API, not the underlying "
@@ -56,6 +61,12 @@ def _message_dict(m: store.Message) -> dict[str, Any]:
         "sent_at": m.sent_at.isoformat(),
         "read_at": m.read_at.isoformat() if m.read_at else None,
         "expires_at": m.expires_at.isoformat(),
+        # v3 lifecycle fields
+        "msg_type": m.msg_type,
+        "in_reply_to": m.in_reply_to,
+        "status": m.status,
+        "status_note": m.status_note,
+        "status_updated_at": (m.status_updated_at.isoformat() if m.status_updated_at else None),
     }
 
 
@@ -122,6 +133,8 @@ def send(
     subject: str | None = None,
     from_: str | None = None,
     session_token: str | None = None,
+    msg_type: str | None = None,
+    in_reply_to: int | None = None,
 ) -> dict[str, Any]:
     """Drop a message into `to`'s inbox.
 
@@ -140,6 +153,14 @@ def send(
     Size cap: body must be <= DLB_MAX_BODY_BYTES (default 256 KiB,
     UTF-8 encoded). Oversized bodies raise DLBError.
 
+    Lifecycle hints (v0.3.0+):
+    - msg_type: advisory tag. Convention: `"task"` signals to the recipient
+      that this message expects action + acknowledgment. The recipient's
+      protocol (see the DLB Inbox Protocol in ~/.claude/CLAUDE.md) says
+      they should reply immediately confirming receipt and stating a plan.
+    - in_reply_to: id of the message this one is replying to (typically a
+      status update on a task-typed message). Enables threading.
+
     Args:
         to: Recipient name.
         body: Message body (free text / Markdown). UTF-8 bytes capped.
@@ -148,6 +169,10 @@ def send(
             session_token's name when both are provided.
         session_token: Optional. When supplied, binds from_ to your
             registered name (and validates it if from_ is also given).
+        msg_type: Optional advisory tag (e.g. "task") signaling recipient
+            behavior. See the DLB Inbox Protocol.
+        in_reply_to: Optional id of the message this is replying to
+            (for threading task-acknowledgment replies to the original task).
     """
     msg = store.send(
         to=to,
@@ -155,6 +180,8 @@ def send(
         subject=subject,
         from_=from_,
         session_token=session_token,
+        msg_type=msg_type,
+        in_reply_to=in_reply_to,
     )
     return _message_dict(msg)
 
@@ -221,6 +248,62 @@ def unregister(name: str, session_token: str) -> dict[str, Any]:
     """
     ok = store.unregister(name, session_token)
     return {"ok": ok, "name": name}
+
+
+@mcp.tool()
+def update_status(
+    message_id: int,
+    status: str,
+    session_token: str,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Update the lifecycle status of a message you received (v0.3.0+).
+
+    Called by the RECIPIENT to signal progress on a task back to the sender.
+    Convention (not enforced by DLB): status ∈ {"queued", "accepted",
+    "running", "done", "blocked"}. Any string is accepted so future
+    conventions can extend without a schema migration.
+
+    Side effect: sets read_at on the message if it was still unread —
+    updating status implies you've read it, so this replaces `ack` for
+    the common case.
+
+    Sender-side counterpart: `get_task_status(message_id)` returns the
+    current status without needing the recipient's session_token.
+
+    Args:
+        message_id: The id returned by send() (task) or read() (task received).
+        status: Free-string status. Convention: queued/accepted/running/done/blocked.
+        session_token: Recipient's token. Required.
+        note: Optional short free-text detail (e.g. "20m ETA", "hit missing
+            fixture", "PR #42").
+    """
+    msg = store.update_status(
+        message_id=message_id,
+        status=status,
+        session_token=session_token,
+        note=note,
+    )
+    return _message_dict(msg)
+
+
+@mcp.tool()
+def get_task_status(message_id: int) -> dict[str, Any] | None:
+    """Query the lifecycle status of a message without reading its body (v0.3.0+).
+
+    NO AUTH — DLB's trust model is coordination between cooperating agents
+    under the same OS user. This is the sender-side counterpart to
+    `update_status`: it lets a sender check "did my task get picked up? is
+    it running? is it done?" without holding the recipient's session_token.
+
+    Returns None if the message id doesn't exist. Otherwise returns a
+    lightweight status dict — NOT the message body. Use `read` if you
+    need the content.
+
+    Args:
+        message_id: The id you received from send() when you dispatched a task.
+    """
+    return store.get_task_status(message_id)
 
 
 # ── Stdio entry point ────────────────────────────────────────────────────────
