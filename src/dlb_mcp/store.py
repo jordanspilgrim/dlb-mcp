@@ -616,34 +616,48 @@ def send(
     if body_bytes > cap:
         raise DLBError(f"body too large: {body_bytes} bytes exceeds DLB_MAX_BODY_BYTES={cap}")
 
-    sender = from_ if from_ is not None else "anonymous"
-    if session_token is not None:
-        with _connect() as conn:
-            row = conn.execute(
-                "SELECT name FROM agents WHERE session_token = ?",
-                (session_token,),
-            ).fetchone()
-            if row is None:
-                raise AuthError("Invalid session_token for send.")
-            authenticated_name = row["name"]
-            if from_ is not None and from_ != authenticated_name:
-                raise AuthError(
-                    f"from_={from_!r} does not match session_token's name "
-                    f"({authenticated_name!r}). Use from_=None to auto-set, "
-                    f"or pass from_={authenticated_name!r}."
-                )
-            sender = authenticated_name
-
     sent_ms = _now_ms()
     expires_ms = sent_ms + ttl_days() * 24 * 60 * 60 * 1000
 
+    # Single connection + explicit BEGIN IMMEDIATE so the token lookup and
+    # the insert are one atomic unit. Prior implementation used two separate
+    # _connect() contexts — a benign TOCTOU: the token could be unregistered
+    # between lookup and insert, worst case binding sender_name to a name
+    # whose holder had just departed. No safety hole, but airtight is cheap
+    # when the fix is one connection.
     with _connect() as conn:
-        cur = conn.execute(
-            "INSERT INTO messages (recipient_name, sender_name, subject, body, "
-            "sent_at_ms, read_at_ms, expires_at_ms) VALUES (?, ?, ?, ?, ?, NULL, ?)",
-            (to, sender, subject, body, sent_ms, expires_ms),
-        )
-        msg_id = cur.lastrowid
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            sender = from_ if from_ is not None else "anonymous"
+            if session_token is not None:
+                row = conn.execute(
+                    "SELECT name FROM agents WHERE session_token = ?",
+                    (session_token,),
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    raise AuthError("Invalid session_token for send.")
+                authenticated_name = row["name"]
+                if from_ is not None and from_ != authenticated_name:
+                    conn.execute("ROLLBACK")
+                    raise AuthError(
+                        f"from_={from_!r} does not match session_token's name "
+                        f"({authenticated_name!r}). Use from_=None to auto-set, "
+                        f"or pass from_={authenticated_name!r}."
+                    )
+                sender = authenticated_name
+
+            cur = conn.execute(
+                "INSERT INTO messages (recipient_name, sender_name, subject, body, "
+                "sent_at_ms, read_at_ms, expires_at_ms) VALUES (?, ?, ?, ?, ?, NULL, ?)",
+                (to, sender, subject, body, sent_ms, expires_ms),
+            )
+            msg_id = cur.lastrowid
+            conn.execute("COMMIT")
+        except Exception:
+            with suppress(sqlite3.OperationalError):
+                conn.execute("ROLLBACK")
+            raise
 
     return Message(
         id=msg_id,  # type: ignore[arg-type]
