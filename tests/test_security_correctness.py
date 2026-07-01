@@ -148,6 +148,141 @@ def test_v1_schema_migrates_to_v2_on_connect(isolated_store) -> None:
     assert msgs[0].body == "hello"
 
 
+def test_migration_drops_legacy_text_columns(isolated_store) -> None:
+    """After migration, the table has ONLY the *_ms columns — the legacy
+    TEXT columns are gone. If they were left in place with NOT NULL,
+    every subsequent send/register would fail with a constraint error."""
+    conn = sqlite3.connect(str(isolated_store))
+    conn.executescript(
+        """
+        CREATE TABLE agents (
+            name           TEXT PRIMARY KEY,
+            working_on     TEXT,
+            registered_at  TEXT NOT NULL,
+            last_seen      TEXT NOT NULL,
+            session_token  TEXT NOT NULL
+        );
+        CREATE TABLE messages (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipient_name  TEXT NOT NULL,
+            sender_name     TEXT NOT NULL,
+            subject         TEXT,
+            body            TEXT NOT NULL,
+            sent_at         TEXT NOT NULL,
+            read_at         TEXT,
+            expires_at      TEXT NOT NULL
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store.init_schema()
+
+    conn = sqlite3.connect(str(isolated_store))
+    agent_cols = {r[1] for r in conn.execute("PRAGMA table_info(agents)").fetchall()}
+    msg_cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    conn.close()
+
+    # Legacy columns must be gone
+    assert "registered_at" not in agent_cols
+    assert "last_seen" not in agent_cols
+    assert "sent_at" not in msg_cols
+    assert "read_at" not in msg_cols
+    assert "expires_at" not in msg_cols
+    # New columns must be present
+    assert "registered_at_ms" in agent_cols
+    assert "last_seen_ms" in agent_cols
+    assert "sent_at_ms" in msg_cols
+    assert "read_at_ms" in msg_cols
+    assert "expires_at_ms" in msg_cols
+
+
+def test_send_works_after_v1_migration(isolated_store) -> None:
+    """The bug this migration rewrite fixes. Before the rebuild, the legacy
+    TEXT columns survived migration with their NOT NULL constraints intact;
+    the v2 INSERT didn't populate them; send() raised IntegrityError. Every
+    existing DLB user would have gotten a broken install on upgrade."""
+    conn = sqlite3.connect(str(isolated_store))
+    conn.executescript(
+        """
+        CREATE TABLE agents (
+            name           TEXT PRIMARY KEY,
+            working_on     TEXT,
+            registered_at  TEXT NOT NULL,
+            last_seen      TEXT NOT NULL,
+            session_token  TEXT NOT NULL
+        );
+        CREATE TABLE messages (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipient_name  TEXT NOT NULL,
+            sender_name     TEXT NOT NULL,
+            subject         TEXT,
+            body            TEXT NOT NULL,
+            sent_at         TEXT NOT NULL,
+            read_at         TEXT,
+            expires_at      TEXT NOT NULL
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+    store.init_schema()
+
+    # Both write paths must succeed after migration
+    r = store.register("post-migration-alpha")
+    assert r["session_token"]
+    msg = store.send(to="post-migration-alpha", body="hi", from_="tester")
+    assert msg.id > 0
+    # And it round-trips: read the message we just sent
+    msgs = store.read("post-migration-alpha", session_token=r["session_token"])
+    assert len(msgs) == 1
+    assert msgs[0].body == "hi"
+
+
+def test_migration_preserves_message_ids(isolated_store) -> None:
+    """A dlb-monitor watermark is `MAX(messages.id)`. If migration reassigned
+    ids (e.g. INSERT SELECT without ROWID preservation), any launcher started
+    before migration would suddenly see all migrated messages as "new" and
+    re-notify. IDs MUST survive."""
+    conn = sqlite3.connect(str(isolated_store))
+    conn.executescript(
+        """
+        CREATE TABLE agents (
+            name           TEXT PRIMARY KEY,
+            working_on     TEXT,
+            registered_at  TEXT NOT NULL,
+            last_seen      TEXT NOT NULL,
+            session_token  TEXT NOT NULL
+        );
+        CREATE TABLE messages (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipient_name  TEXT NOT NULL,
+            sender_name     TEXT NOT NULL,
+            subject         TEXT,
+            body            TEXT NOT NULL,
+            sent_at         TEXT NOT NULL,
+            read_at         TEXT,
+            expires_at      TEXT NOT NULL
+        );
+        INSERT INTO messages (id, recipient_name, sender_name, body,
+            sent_at, expires_at)
+        VALUES
+            (7, 'alpha', 's', 'first',  '2026-01-01T00:00:00+00:00', '2099-01-01T00:00:00+00:00'),
+            (42, 'alpha', 's', 'second', '2026-01-01T00:00:00+00:00', '2099-01-01T00:00:00+00:00');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store.init_schema()
+
+    conn = sqlite3.connect(str(isolated_store))
+    ids = sorted(r[0] for r in conn.execute("SELECT id FROM messages"))
+    conn.close()
+    assert ids == [7, 42]
+
+
 def test_init_schema_is_idempotent_post_migration(isolated_store) -> None:
     """Calling init_schema() twice on an already-v2 DB is a no-op."""
     store.register("alpha")

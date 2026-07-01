@@ -185,7 +185,11 @@ def init_schema() -> None:
 
 
 def _create_v2_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(
+    """Create v2 tables + index. Uses individual execute() calls (NOT
+    executescript) because executescript disregards isolation_level and
+    commits mid-script — which would close a caller's outer transaction
+    when this is invoked from inside `_migrate_v1_to_v2`."""
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS agents (
             name              TEXT PRIMARY KEY,
@@ -193,8 +197,11 @@ def _create_v2_schema(conn: sqlite3.Connection) -> None:
             registered_at_ms  INTEGER NOT NULL,
             last_seen_ms      INTEGER NOT NULL,
             session_token     TEXT NOT NULL
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS messages (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             recipient_name  TEXT NOT NULL,
@@ -204,69 +211,98 @@ def _create_v2_schema(conn: sqlite3.Connection) -> None:
             sent_at_ms      INTEGER NOT NULL,
             read_at_ms      INTEGER,
             expires_at_ms   INTEGER NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_messages_recipient
-            ON messages(recipient_name, read_at_ms, sent_at_ms DESC);
+        )
         """
     )
-
-
-def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
-    """One-shot in-place migration: add INTEGER ms columns, backfill from
-    the existing TEXT ISO timestamps, then leave the old columns as inert
-    legacy. Idempotent under retry (ADD COLUMN is guarded by a probe)."""
-    existing_agent_cols = {r["name"] for r in conn.execute("PRAGMA table_info(agents)")}
-    existing_msg_cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
-
-    if "registered_at_ms" not in existing_agent_cols:
-        conn.execute("ALTER TABLE agents ADD COLUMN registered_at_ms INTEGER")
-    if "last_seen_ms" not in existing_agent_cols:
-        conn.execute("ALTER TABLE agents ADD COLUMN last_seen_ms INTEGER")
-    if "sent_at_ms" not in existing_msg_cols:
-        conn.execute("ALTER TABLE messages ADD COLUMN sent_at_ms INTEGER")
-    if "read_at_ms" not in existing_msg_cols:
-        conn.execute("ALTER TABLE messages ADD COLUMN read_at_ms INTEGER")
-    if "expires_at_ms" not in existing_msg_cols:
-        conn.execute("ALTER TABLE messages ADD COLUMN expires_at_ms INTEGER")
-
-    # Backfill agents
-    for r in conn.execute(
-        "SELECT name, registered_at, last_seen FROM agents WHERE "
-        "registered_at_ms IS NULL OR last_seen_ms IS NULL"
-    ).fetchall():
-        reg_ms = _iso_to_ms(r["registered_at"]) or _now_ms()
-        seen_ms = _iso_to_ms(r["last_seen"]) or reg_ms
-        conn.execute(
-            "UPDATE agents SET registered_at_ms = ?, last_seen_ms = ? WHERE name = ?",
-            (reg_ms, seen_ms, r["name"]),
-        )
-
-    # Backfill messages
-    for r in conn.execute(
-        "SELECT id, sent_at, read_at, expires_at FROM messages WHERE "
-        "sent_at_ms IS NULL OR expires_at_ms IS NULL"
-    ).fetchall():
-        sent_ms = _iso_to_ms(r["sent_at"]) or _now_ms()
-        read_ms = _iso_to_ms(r["read_at"]) if r["read_at"] else None
-        # If expires_at is missing/unparseable, default to "expired" so the
-        # next lazy purge cleans it up — safer than keeping orphan rows
-        # forever.
-        exp_ms = _iso_to_ms(r["expires_at"]) or 0
-        conn.execute(
-            "UPDATE messages SET sent_at_ms = ?, read_at_ms = ?, expires_at_ms = ? WHERE id = ?",
-            (sent_ms, read_ms, exp_ms, r["id"]),
-        )
-
-    # Replace the old index (which referenced the TEXT columns) with one
-    # over the new INTEGER columns. SQLite happily keeps both — but the
-    # old one is wasted maintenance, so drop it.
-    with suppress(sqlite3.OperationalError):
-        conn.execute("DROP INDEX IF EXISTS idx_messages_recipient")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_messages_recipient "
         "ON messages(recipient_name, read_at_ms, sent_at_ms DESC)"
     )
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """Rebuild agents + messages tables into pure v2 shape.
+
+    v1 stored timestamps as TEXT ISO strings; v2 stores INTEGER epoch-ms.
+    An earlier draft of this migration used ADD COLUMN + backfill and left
+    the legacy TEXT columns in place — but v2 INSERT statements don't
+    populate them, and the legacy columns declare NOT NULL, so every send
+    or register on a migrated DB failed with "NOT NULL constraint failed".
+
+    The correct migration is a table rebuild: rename → create clean → copy
+    with conversion → drop backup. SQLite's ALTER TABLE cannot relax a
+    NOT NULL constraint, so this is the only path. Wrapped in an explicit
+    IMMEDIATE transaction so a crash mid-migration leaves the DB in a
+    consistent state (either fully v1 or fully v2, never a broken hybrid).
+
+    Idempotent: if a prior partial migration left backup tables around,
+    they are dropped up front before the rename.
+    """
+    # Belt-and-suspenders: clear any leftover backup tables from a
+    # previously-interrupted migration attempt. DROP IF EXISTS is a no-op
+    # when the tables aren't there.
+    conn.execute("DROP TABLE IF EXISTS agents_v1_backup")
+    conn.execute("DROP TABLE IF EXISTS messages_v1_backup")
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # 1. Move the v1 tables out of the way
+        conn.execute("ALTER TABLE agents RENAME TO agents_v1_backup")
+        conn.execute("ALTER TABLE messages RENAME TO messages_v1_backup")
+
+        # 2. Create the fresh v2 tables (identical shape to _create_v2_schema)
+        _create_v2_schema(conn)
+
+        # 3. Copy agents with timestamp conversion. If an ISO parse fails,
+        #    default to _now_ms() (better than losing the row; the agent
+        #    can re-register to fix its timestamps).
+        for r in conn.execute(
+            "SELECT name, working_on, registered_at, last_seen, session_token FROM agents_v1_backup"
+        ).fetchall():
+            reg_ms = _iso_to_ms(r["registered_at"]) or _now_ms()
+            seen_ms = _iso_to_ms(r["last_seen"]) or reg_ms
+            conn.execute(
+                "INSERT INTO agents (name, working_on, registered_at_ms, "
+                "last_seen_ms, session_token) VALUES (?, ?, ?, ?, ?)",
+                (r["name"], r["working_on"], reg_ms, seen_ms, r["session_token"]),
+            )
+
+        # 4. Copy messages. Unparseable expires_at → 0 so the next lazy
+        #    purge cleans up the orphan; unparseable sent_at → _now_ms()
+        #    (better to have the message with an approximate timestamp
+        #    than to lose it).
+        for r in conn.execute(
+            "SELECT id, recipient_name, sender_name, subject, body, "
+            "sent_at, read_at, expires_at FROM messages_v1_backup ORDER BY id ASC"
+        ).fetchall():
+            sent_ms = _iso_to_ms(r["sent_at"]) or _now_ms()
+            read_ms = _iso_to_ms(r["read_at"]) if r["read_at"] else None
+            exp_ms = _iso_to_ms(r["expires_at"]) or 0
+            conn.execute(
+                "INSERT INTO messages (id, recipient_name, sender_name, subject, "
+                "body, sent_at_ms, read_at_ms, expires_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    r["id"],
+                    r["recipient_name"],
+                    r["sender_name"],
+                    r["subject"],
+                    r["body"],
+                    sent_ms,
+                    read_ms,
+                    exp_ms,
+                ),
+            )
+
+        # 5. Drop the backup tables and any legacy index
+        conn.execute("DROP TABLE agents_v1_backup")
+        conn.execute("DROP TABLE messages_v1_backup")
+
+        conn.execute("COMMIT")
+    except Exception:
+        with suppress(sqlite3.OperationalError):
+            conn.execute("ROLLBACK")
+        raise
 
 
 # ── Time helpers ─────────────────────────────────────────────────────────────
