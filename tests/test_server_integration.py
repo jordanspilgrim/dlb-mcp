@@ -125,9 +125,16 @@ def test_full_happy_path(server: subprocess.Popen) -> None:
     assert tools_resp
     tools = tools_resp[0]["result"]["tools"]
     names = {t["name"] for t in tools}
-    assert names == {"register", "list_threads", "send", "read", "ack", "unregister"}, (
-        f"unexpected tool set: {names}"
-    )
+    assert names == {
+        "register",
+        "list_threads",
+        "send",
+        "read",
+        "ack",
+        "unregister",
+        "update_status",
+        "get_task_status",
+    }, f"unexpected tool set: {names}"
 
     # 2. Register alpha
     reg = _call(server, 2, "register", {"name": "alpha", "working_on": "testing"})

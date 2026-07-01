@@ -53,18 +53,62 @@ Add to `~/.claude.json`:
 
 Multiple sessions can coexist — they all share `~/.dlb/store.sqlite3` via SQLite WAL mode.
 
-## The 6 tools
+## The 8 tools
 
 | Tool | What it does |
 |---|---|
 | `register(name, working_on=None, force=False, prior_token=None)` | Declare a name + status. Returns `session_token`. Conflict on existing active name → error with suggestion. `force=True` requires either `prior_token` matching the holder, or the holder being stale > `DLB_TAKEOVER_AFTER_SECONDS`. |
 | `list_threads(active_within="24h")` | See who's around. No auth. |
-| `send(to, body, subject=None, from_=None, session_token=None)` | Drop a message. Always succeeds (subject to size cap) — even if `to` doesn't exist yet. Pass `session_token` to bind `from_` to your registered name (otherwise `from_` is unverified free text). |
-| `read(name, session_token, unread_only=True, limit=20)` | Read inbox. Requires session_token for registered names. |
-| `ack(message_id, session_token)` | Explicit "I saw this and acted on it". Optional. |
+| `send(to, body, subject=None, from_=None, session_token=None, msg_type=None, in_reply_to=None)` | Drop a message. Always succeeds (subject to size cap) — even if `to` doesn't exist yet. Pass `session_token` to bind `from_` to your registered name (otherwise `from_` is unverified free text). Pass `msg_type="task"` for messages the recipient must acknowledge; pass `in_reply_to=<id>` to thread a reply to an earlier message. |
+| `read(name, session_token, unread_only=True, limit=20)` | Read inbox. Requires session_token for registered names. Returns full lifecycle fields on each message. |
+| `ack(message_id, session_token)` | Explicit "I saw this and acted on it". Optional; superseded by `update_status` for the common case. |
 | `unregister(name, session_token)` | Release the name. Messages preserved for re-registration. |
+| **`update_status(message_id, status, session_token, note=None)`** | **(v0.3.0+)** Recipient signals lifecycle state on a message they received. Convention: `queued/accepted/running/done/blocked` (any string accepted). Also sets `read_at` if the message was still unread. |
+| **`get_task_status(message_id)`** | **(v0.3.0+)** Sender-side probe. No auth — returns the current `status`, `status_note`, `msg_type`, `in_reply_to`, and `read_at` of any message id. Lightweight (does NOT return body). Fixes the "did my task get picked up?" gap. |
 
 That's the entire API.
+
+## Task lifecycle (v0.3.0+) — the pattern that closes the "delivered ≠ acted on" gap
+
+DLB 0.2.x guaranteed delivery and read-receipts, but a message the recipient had read yet not acted on was indistinguishable (to the sender) from a task in progress. A documented incident (2026-07-01) had a security-review task sit unexecuted for ~1 hour with no signal.
+
+v0.3.0 adds the minimum vocabulary to close that gap **as a convention, not enforcement** — DLB stays a small file store; the state machine lives in the CLAUDE.md DLB Inbox Protocol.
+
+**Sender pattern:**
+```python
+task = send(to="worker", body="run /security-review", msg_type="task")
+# ... later, without holding worker's session_token:
+status = get_task_status(task.id)
+# → {"status": "running", "status_note": "scanning src/", "read_at": "..."}
+```
+
+**Recipient pattern** (as required by the DLB Inbox Protocol in `~/.claude/CLAUDE.md`):
+```python
+inbox = read(name="worker", session_token=my_token)
+for msg in inbox:
+    if msg.msg_type == "task":
+        # STEP 1: reply IMMEDIATELY (before starting work)
+        send(to=msg.sender_name, body="accepted, ETA 20m",
+             session_token=my_token, in_reply_to=msg.id)
+        update_status(msg.id, "accepted", my_token, note="ETA 20m")
+
+        # STEP 2: do the work
+        result = do_work(msg.body)
+        update_status(msg.id, "running", my_token, note="in progress")
+
+        # STEP 3: report completion
+        send(to=msg.sender_name, body=f"done: {result}",
+             session_token=my_token, in_reply_to=msg.id)
+        update_status(msg.id, "done", my_token, note=result)
+```
+
+**What DLB does NOT do:**
+- No enforcement — nothing forces `status` values to a fixed set.
+- No SLA nudges — DLB won't automatically re-notify a stale task. That's a job for a task-orchestration product built on top of DLB.
+- No heartbeat beacons — the recipient calls `update_status` explicitly when the state changes.
+- No history — only the LATEST status per message is stored; note-per-status is not preserved.
+
+If you need any of those, you want a full task-orchestration layer, not more features on DLB.
 
 ## Push-like wake — `dlb-monitor` + Claude Code's Monitor tool
 

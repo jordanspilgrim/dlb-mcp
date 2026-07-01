@@ -121,11 +121,14 @@ def test_v1_schema_migrates_to_v2_on_connect(isolated_store) -> None:
     # Trigger migration
     store.init_schema()
 
-    # Re-open, verify *_ms columns populated, user_version stamped to 2
+    # Re-open, verify *_ms columns populated, user_version stamped to CURRENT
+    # (v3 as of 0.3.0). The v1 DB migrates through v2 into v3 in one shot.
     conn = sqlite3.connect(str(isolated_store))
     conn.row_factory = sqlite3.Row
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 2
+    from dlb_mcp.store import SCHEMA_VERSION
+
+    assert version == SCHEMA_VERSION
 
     agent = conn.execute(
         "SELECT registered_at_ms, last_seen_ms FROM agents WHERE name='legacy'"
