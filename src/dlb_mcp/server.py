@@ -21,9 +21,14 @@ mcp = FastMCP(
     instructions=(
         "DLB — Dead Letter Box. Six tools for inter-agent messaging:\n"
         "  register, list_threads, send, read, ack, unregister.\n"
-        "Send is open (no auth). Read/ack/unregister on a registered name "
-        "require its session_token.\n"
-        "Sends to nonexistent recipients are queued and delivered on later registration."
+        "Send is open (no auth); pass session_token on send to bind from_ to "
+        "your registered name (otherwise from_ is unverified free text).\n"
+        "Read/ack/unregister on a registered name require its session_token.\n"
+        "Sends to nonexistent recipients are queued and delivered on later "
+        "registration.\n"
+        "Trust boundary: session_token gates the tool API, not the underlying "
+        "SQLite file. DLB is coordination between cooperating agents under the "
+        "same OS user — not confidentiality."
     ),
 )
 
@@ -62,15 +67,23 @@ def register(
     name: str,
     working_on: str | None = None,
     force: bool = False,
+    prior_token: str | None = None,
 ) -> dict[str, Any]:
     """Declare or refresh an agent identity.
 
     Returns the agent record plus a `session_token` you must keep — it's
     required for `read`, `ack`, and `unregister` on this name.
 
-    Conflict behavior: if the name is already registered to an active
-    session and you don't pass `force=True`, raises an error with up to
-    three suggested alternatives (e.g., `alpha-2`, `alpha-3`).
+    Conflict behavior:
+    - Name unused → register normally.
+    - Name held, force=False → NameConflict with up to three suggestions
+      (e.g. `alpha-2`, `alpha-3`).
+    - Name held, force=True:
+        - If `prior_token` matches the current holder → take it immediately.
+        - Else if the holder has been silent longer than
+          DLB_TAKEOVER_AFTER_SECONDS (default 24h) → take it.
+        - Else → TakeoverDenied (preserves the "reclaim a dead session"
+          use case while blocking casual hijack of a live session).
 
     Args:
         name: Stable identifier you'll be addressed by. Accepted as-given
@@ -78,10 +91,12 @@ def register(
             "worker-1".
         working_on: Free-text description of what this agent is doing.
             Shown to other agents via `list_threads`. Optional.
-        force: If True, evict the prior session holding this name and
-            take it over. Use with care — silently kicks the previous owner.
+        force: If True, attempt to evict the prior session. Stale-gated —
+            see conflict behavior above.
+        prior_token: The current holder's session_token, if you have it.
+            Lets a legitimate handoff bypass the stale-gate on force=True.
     """
-    return store.register(name, working_on=working_on, force=force)
+    return store.register(name, working_on=working_on, force=force, prior_token=prior_token)
 
 
 @mcp.tool()
@@ -106,25 +121,41 @@ def send(
     body: str,
     subject: str | None = None,
     from_: str | None = None,
+    session_token: str | None = None,
 ) -> dict[str, Any]:
     """Drop a message into `to`'s inbox.
 
-    ALWAYS succeeds, even if `to` is not registered yet. This is DLB's
-    namesake feature — messages queue under the name, and will be in the
-    recipient's inbox when they register (or whenever someone reads under
-    that name).
+    ALWAYS succeeds (subject to size cap), even if `to` is not registered
+    yet. Messages queue under the name and surface when someone reads it.
 
-    No auth required. The sender is identified by the `from_` field you
-    pass; if omitted, it's the literal string "anonymous". DLB does not
-    try to auto-identify the caller.
+    Provenance:
+    - Without session_token: from_ is whatever the caller passed (default
+      "anonymous"). Free text — unverified. The sender label could be a lie.
+    - With session_token: token is looked up. If from_ is omitted, it
+      becomes the token's registered name. If from_ is supplied, it MUST
+      match the token's name or AuthError is raised. A message claiming to
+      be from a registered name X is then either authenticated or anonymous
+      — never spoofed.
+
+    Size cap: body must be <= DLB_MAX_BODY_BYTES (default 256 KiB,
+    UTF-8 encoded). Oversized bodies raise DLBError.
 
     Args:
         to: Recipient name.
-        body: Message body (free text / Markdown).
+        body: Message body (free text / Markdown). UTF-8 bytes capped.
         subject: Optional short subject line.
-        from_: Sender label. Defaults to "anonymous".
+        from_: Sender label. Defaults to "anonymous". Must match the
+            session_token's name when both are provided.
+        session_token: Optional. When supplied, binds from_ to your
+            registered name (and validates it if from_ is also given).
     """
-    msg = store.send(to=to, body=body, subject=subject, from_=from_)
+    msg = store.send(
+        to=to,
+        body=body,
+        subject=subject,
+        from_=from_,
+        session_token=session_token,
+    )
     return _message_dict(msg)
 
 
