@@ -445,3 +445,71 @@ def test_send_with_invalid_token_raises_autherror() -> None:
     caller bug worth surfacing."""
     with pytest.raises(AuthError):
         store.send(to="ghost", body="hi", session_token="bogus-token")
+
+
+def test_authenticated_send_uses_a_single_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The token lookup and message insert MUST share one SQLite connection
+    (so BEGIN IMMEDIATE makes them one transaction). Prior implementation
+    used two separate _connect() contexts — a benign TOCTOU: the token
+    could be unregistered between lookup and insert, silently binding
+    sender_name to a just-departed name.
+
+    We prove the fix by counting _connect() invocations during a
+    token-authenticated send. Before the fix: 2. After the fix: 1.
+    Locks the "one connection" invariant so a well-meaning future refactor
+    can't silently reintroduce the race.
+    """
+    from dlb_mcp import store as store_module
+
+    reg = store.register("alpha")
+
+    # Skip init_schema (which itself opens a connection) so the count
+    # reflects only the send's own I/O.
+    monkeypatch.setattr(store_module, "init_schema", lambda: None)
+
+    original_connect = store_module._connect
+    call_count = {"n": 0}
+
+    def counting_connect(*a, **kw):
+        call_count["n"] += 1
+        return original_connect(*a, **kw)
+
+    monkeypatch.setattr(store_module, "_connect", counting_connect)
+
+    msg = store.send(to="ghost", body="atomic", session_token=reg["session_token"])
+    assert msg.sender_name == "alpha"
+    # Exactly one _connect() call — the lookup and insert are on the same
+    # connection inside one BEGIN IMMEDIATE transaction.
+    assert call_count["n"] == 1, (
+        f"authenticated send opened {call_count['n']} connections; expected 1 "
+        "(regression — the token lookup and insert are no longer atomic)"
+    )
+
+
+def test_unauthenticated_send_still_uses_a_single_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sanity check: the un-tokened path was already single-connection.
+    Locking it in so a future refactor doesn't quietly split it."""
+    from dlb_mcp import store as store_module
+
+    # Prime the schema before patching init_schema to a no-op (isolated
+    # fixture creates an empty file; without init_schema the messages
+    # table wouldn't exist for the INSERT).
+    store_module.init_schema()
+
+    monkeypatch.setattr(store_module, "init_schema", lambda: None)
+
+    original_connect = store_module._connect
+    call_count = {"n": 0}
+
+    def counting_connect(*a, **kw):
+        call_count["n"] += 1
+        return original_connect(*a, **kw)
+
+    monkeypatch.setattr(store_module, "_connect", counting_connect)
+
+    store.send(to="ghost", body="hi")
+    assert call_count["n"] == 1
