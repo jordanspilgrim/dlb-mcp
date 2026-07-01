@@ -1,0 +1,222 @@
+"""dlb-monitor — push-like wake source for the Claude Code Monitor tool.
+
+Polls the DLB SQLite store and emits one stdout line per NEW message
+(newest first within a poll tick). Each line is in turn delivered to
+the LLM as a notification by the `Monitor` tool, effectively turning
+the request-response MCP into a push channel without any new server,
+daemon, or socket.
+
+Usage from inside Claude Code:
+
+    Monitor({
+      command: "dlb-monitor --name alpha",
+      description: "DLB inbox: alpha",
+      persistent: true
+    })
+
+Output format (one event per line, line-buffered so each is delivered
+immediately):
+
+    2026-06-30T21:30:14Z bravo: "ping — can you look at the reskin route?"
+
+The watermark is taken from MAX(messages.id) for the target recipient
+at startup, so pre-existing mail is intentionally not re-surfaced (that
+is the SessionStart hook's responsibility — re-surfacing here would
+double-notify on every relaunch).
+
+Filters:
+  --include-senders bob,carol   only notify on messages from these names
+  --exclude-senders bot,system  drop messages from these names
+                                 (--include and --exclude are mutually
+                                 exclusive)
+
+Process model: pure poller. Exits on Ctrl-C (Monitor stops it cleanly
+on session end). All errors are logged to stderr and the loop continues
+— a single SQLite hiccup must not kill the wake source.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sqlite3
+import sys
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+from . import store
+
+DEFAULT_INTERVAL_SECONDS = 2.0
+DEFAULT_BODY_PREVIEW_LEN = 80
+
+
+def _format_event(
+    sent_at_ms: int,
+    sender: str,
+    subject: str | None,
+    body: str,
+    preview_len: int = DEFAULT_BODY_PREVIEW_LEN,
+) -> str:
+    """One-line, line-buffered event format.
+
+    The leading ISO timestamp + space is a deliberate readability concession
+    — Claude Code's Monitor shows the line verbatim in the notification,
+    and a date prefix makes it obvious when the wake fired.
+    """
+    ts = datetime.fromtimestamp(sent_at_ms / 1000, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    snippet = subject if subject else body
+    snippet = snippet.replace("\n", " ").strip()
+    if len(snippet) > preview_len:
+        snippet = snippet[: preview_len - 1] + "…"
+    return f'{ts} {sender}: "{snippet}"'
+
+
+def _baseline_max_id(db_path: Path, recipient: str) -> int:
+    """Highest message.id currently in the recipient's inbox. Returns 0 on
+    empty/missing DB so the first real message lands above it."""
+    if not db_path.exists():
+        return 0
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM messages WHERE recipient_name = ?",
+                (recipient,),
+            ).fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        print(f"dlb-monitor: warning: baseline query failed: {e}", file=sys.stderr)
+        return 0
+
+
+def _fetch_new(
+    db_path: Path,
+    recipient: str,
+    since_id: int,
+) -> list[tuple[int, int, str, str | None, str]]:
+    """Return (id, sent_at_ms, sender_name, subject, body) for any message
+    in `recipient`'s inbox with id > since_id, oldest first so events fire
+    in arrival order. Empty list on error (logged, loop continues)."""
+    if not db_path.exists():
+        return []
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            rows = conn.execute(
+                "SELECT id, sent_at_ms, sender_name, subject, body FROM messages "
+                "WHERE recipient_name = ? AND id > ? ORDER BY id ASC",
+                (recipient, since_id),
+            ).fetchall()
+            return [(int(r[0]), int(r[1]), r[2], r[3], r[4]) for r in rows]
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        print(f"dlb-monitor: warning: fetch failed: {e}", file=sys.stderr)
+        return []
+
+
+def run(
+    name: str,
+    interval_seconds: float,
+    include_senders: set[str] | None,
+    exclude_senders: set[str] | None,
+) -> int:
+    """Main poll loop. Returns exit code (0 on clean Ctrl-C)."""
+    db_path = store.store_path()
+    # init_schema runs migration on a legacy v1 DB so we can read *_ms
+    # safely. Safe to call here — it's idempotent.
+    try:
+        store.init_schema()
+    except Exception as e:
+        print(f"dlb-monitor: warning: init_schema failed: {e}", file=sys.stderr)
+
+    seen_max_id = _baseline_max_id(db_path, name)
+    # Brief diagnostic to stderr so users can see "I started, here's my baseline".
+    # stderr does NOT become a Monitor notification; only stdout does.
+    print(
+        f"dlb-monitor: watching '{name}' in {db_path} (baseline id={seen_max_id}, "
+        f"interval={interval_seconds}s)",
+        file=sys.stderr,
+    )
+
+    try:
+        while True:
+            new_msgs = _fetch_new(db_path, name, seen_max_id)
+            for msg_id, sent_ms, sender, subject, body in new_msgs:
+                filtered = (include_senders is not None and sender not in include_senders) or (
+                    exclude_senders is not None and sender in exclude_senders
+                )
+                if not filtered:
+                    line = _format_event(sent_ms, sender, subject, body)
+                    print(line, flush=True)
+                # Always advance watermark — filtered messages still happened.
+                seen_max_id = max(seen_max_id, msg_id)
+            time.sleep(interval_seconds)
+    except KeyboardInterrupt:
+        print("dlb-monitor: stopping (KeyboardInterrupt)", file=sys.stderr)
+        return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="dlb-monitor",
+        description=(
+            "Emit one stdout line per new DLB message for `--name`. "
+            "Designed to be wrapped by Claude Code's Monitor tool to "
+            "convert DLB's polling model into a push notification."
+        ),
+    )
+    parser.add_argument("--name", required=True, help="DLB inbox name to watch.")
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=float(os.environ.get("DLB_MONITOR_INTERVAL", DEFAULT_INTERVAL_SECONDS)),
+        help=f"Poll interval in seconds (default {DEFAULT_INTERVAL_SECONDS}, "
+        "overridable via DLB_MONITOR_INTERVAL).",
+    )
+    parser.add_argument(
+        "--include-senders",
+        default=None,
+        help=(
+            "Comma-separated allowlist of sender names. Mutually exclusive with --exclude-senders."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-senders",
+        default=None,
+        help=(
+            "Comma-separated denylist of sender names. Mutually exclusive with --include-senders."
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    if args.include_senders and args.exclude_senders:
+        parser.error("--include-senders and --exclude-senders are mutually exclusive")
+
+    include = (
+        {s.strip() for s in args.include_senders.split(",") if s.strip()}
+        if args.include_senders
+        else None
+    )
+    exclude = (
+        {s.strip() for s in args.exclude_senders.split(",") if s.strip()}
+        if args.exclude_senders
+        else None
+    )
+
+    if args.interval <= 0:
+        parser.error("--interval must be positive")
+
+    return run(
+        name=args.name,
+        interval_seconds=args.interval,
+        include_senders=include,
+        exclude_senders=exclude,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())
