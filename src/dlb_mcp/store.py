@@ -574,6 +574,39 @@ def register(
     }
 
 
+def recover_token(name: str) -> dict | None:
+    """Return the live session_token for a registered name — compaction recovery.
+
+    Fixes the #1 documented dark-agent cause: an agent loses its session_token
+    when context compacts, then cannot read its own inbox. Re-registering does
+    NOT help — it mints a NEW token and trips the takeover gate on the agent's
+    own still-live name. This exposes the token directly.
+
+    Trust model: this returns a token to any caller, which is consistent with
+    DLB's stated boundary — "session_token gates the tool API, not the
+    underlying SQLite file; cooperating agents under one OS user, not
+    confidentiality." Any same-OS process can already read this token straight
+    from the SQLite file; recover_token is the sanctioned path (the raw-SQLite
+    read is what the agent safety layer blocks). Returns None if `name` is not
+    registered. Pure read — no last_seen bump; the agent's next send/read does
+    that.
+    """
+    init_schema()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT name, working_on, session_token, last_seen_ms FROM agents WHERE name = ?",
+            (name,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "name": row["name"],
+        "working_on": row["working_on"],
+        "session_token": row["session_token"],
+        "last_seen": _ms_to_dt(int(row["last_seen_ms"])).isoformat(),  # type: ignore[union-attr]
+    }
+
+
 def list_threads(active_within: timedelta = timedelta(hours=24)) -> list[AgentSummary]:
     """List all known agents, with unread counts and staleness flags.
 

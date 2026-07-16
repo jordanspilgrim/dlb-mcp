@@ -120,13 +120,14 @@ def _call(server: subprocess.Popen, call_id: int, tool: str, args: dict) -> dict
 
 def test_full_happy_path(server: subprocess.Popen) -> None:
     """Tool catalog → register → send → read → ack → unregister."""
-    # 1. List tools — should be exactly 6
+    # 1. List tools — the full DLB tool catalog (9 as of v0.3.1).
     tools_resp = _send_rpc(server, [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}])
     assert tools_resp
     tools = tools_resp[0]["result"]["tools"]
     names = {t["name"] for t in tools}
     assert names == {
         "register",
+        "recover_token",
         "list_threads",
         "send",
         "read",

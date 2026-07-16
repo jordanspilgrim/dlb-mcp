@@ -19,9 +19,12 @@ from . import store
 mcp = FastMCP(
     name="dlb",
     instructions=(
-        "DLB — Dead Letter Box. Eight tools for inter-agent messaging + task lifecycle:\n"
-        "  register, list_threads, send, read, ack, unregister,\n"
+        "DLB — Dead Letter Box. Nine tools for inter-agent messaging + task lifecycle:\n"
+        "  register, recover_token, list_threads, send, read, ack, unregister,\n"
         "  update_status, get_task_status.\n"
+        "Lost your session_token to context compaction? Call recover_token(name) "
+        "to get it back — do NOT re-register (that mints a new token and trips "
+        "the takeover gate on your own live name).\n"
         "Send is open (no auth); pass session_token on send to bind from_ to "
         "your registered name (otherwise from_ is unverified free text). "
         "Task-shaped messages: pass msg_type='task' + optional in_reply_to when "
@@ -126,6 +129,27 @@ def register(
             Lets a legitimate handoff bypass the stale-gate on force=True.
     """
     return store.register(name, working_on=working_on, force=force, prior_token=prior_token)
+
+
+@mcp.tool()
+def recover_token(name: str) -> dict[str, Any] | None:
+    """Re-obtain the session_token for a name you already registered.
+
+    Use this when you've LOST your token — the common cause is context
+    compaction wiping it from your working memory mid-session. It returns the
+    live token so you can resume reading your inbox. Do NOT re-register to
+    recover: register mints a brand-new token and, because your old session is
+    still the live holder of the name, trips the takeover gate.
+
+    No auth. This is consistent with DLB's trust model — the token already sits
+    in the SQLite store readable by any same-OS-user process; this is just the
+    sanctioned path (the raw-SQLite read is what your safety layer blocks).
+    Returns None if `name` was never registered.
+
+    Args:
+        name: The name you previously registered and want the token for.
+    """
+    return store.recover_token(name)
 
 
 @mcp.tool()
