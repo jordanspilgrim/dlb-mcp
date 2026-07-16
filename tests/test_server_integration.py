@@ -128,6 +128,7 @@ def test_full_happy_path(server: subprocess.Popen) -> None:
     assert names == {
         "register",
         "recover_token",
+        "set_status",
         "list_threads",
         "send",
         "read",

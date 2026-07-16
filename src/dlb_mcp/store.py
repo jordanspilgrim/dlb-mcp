@@ -45,7 +45,7 @@ DEFAULT_TTL_DAYS = 7
 DEFAULT_MAX_BODY_BYTES = 256 * 1024  # 256 KiB
 DEFAULT_TAKEOVER_AFTER_SECONDS = 24 * 60 * 60  # 24h: matches list_threads' default stale window
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def store_path() -> Path:
@@ -158,6 +158,9 @@ class AgentSummary:
     last_seen: datetime
     unread_count: int
     stale: bool  # True if last_seen older than active_within window
+    # v5 liveness (rec #3): agent-self-reported status beats the last_seen proxy.
+    status: str | None = None  # convention: working | idle | blocked | done
+    status_detail: str | None = None  # free text, e.g. "on: PR #42 review" when blocked
 
 
 @dataclass
@@ -248,25 +251,32 @@ def init_schema() -> None:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='agents'"
             ).fetchone()
             if row is None:
-                # Truly fresh — create current schema directly (already v4).
+                # Truly fresh — create current schema directly (already v5).
                 _create_current_schema(conn)
             else:
                 # Legacy v1 DB without a user_version stamp. Migrate all the way up.
                 _migrate_v1_to_v2(conn)
                 _migrate_v2_to_v3(conn)
                 _migrate_v3_to_v4(conn)
+                _migrate_v4_to_v5(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif current_version == 1:
             _migrate_v1_to_v2(conn)
             _migrate_v2_to_v3(conn)
             _migrate_v3_to_v4(conn)
+            _migrate_v4_to_v5(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif current_version == 2:
             _migrate_v2_to_v3(conn)
             _migrate_v3_to_v4(conn)
+            _migrate_v4_to_v5(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif current_version == 3:
             _migrate_v3_to_v4(conn)
+            _migrate_v4_to_v5(conn)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        elif current_version == 4:
+            _migrate_v4_to_v5(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -282,7 +292,9 @@ def _create_current_schema(conn: sqlite3.Connection) -> None:
             working_on        TEXT,
             registered_at_ms  INTEGER NOT NULL,
             last_seen_ms      INTEGER NOT NULL,
-            session_token     TEXT NOT NULL
+            session_token     TEXT NOT NULL,
+            status            TEXT,
+            status_detail     TEXT
         )
         """
     )
@@ -322,6 +334,15 @@ def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
     existing = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
     if "headline" not in existing:
         conn.execute("ALTER TABLE messages ADD COLUMN headline TEXT")
+
+
+def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
+    """Additive v4 → v5: add nullable `status` + `status_detail` to agents for
+    self-reported liveness (rec #3). Idempotent (guarded by a table_info probe)."""
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(agents)")}
+    for col in ("status", "status_detail"):
+        if col not in existing:
+            conn.execute(f"ALTER TABLE agents ADD COLUMN {col} TEXT")
 
 
 def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
@@ -640,8 +661,8 @@ def register(
             else:
                 conn.execute(
                     "INSERT INTO agents (name, working_on, registered_at_ms, "
-                    "last_seen_ms, session_token) VALUES (?, ?, ?, ?, ?)",
-                    (name, working_on, now_ms, now_ms, token),
+                    "last_seen_ms, session_token, status) VALUES (?, ?, ?, ?, ?, ?)",
+                    (name, working_on, now_ms, now_ms, token, "working"),
                 )
             conn.execute("COMMIT")
         except Exception:
@@ -658,6 +679,48 @@ def register(
         "registered_at": now_iso,
         "last_seen": now_iso,
         "session_token": token,
+    }
+
+
+def set_status(name: str, session_token: str, status: str, detail: str | None = None) -> dict:
+    """Set an agent's self-reported liveness status (rec #3).
+
+    Convention (not enforced): status ∈ {working, idle, blocked, done}; any
+    string is accepted. `detail` is optional free text (e.g. what you're blocked
+    on). Requires the name's session_token. Also bumps last_seen — reporting
+    status is itself a heartbeat, so `list_threads` can distinguish a
+    quiet-but-alive agent from a stopped one. Returns the updated summary.
+    """
+    init_schema()
+    if not status or not isinstance(status, str):
+        raise DLBError("status must be a non-empty string")
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT session_token FROM agents WHERE name = ?", (name,)
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise DLBError(f"Cannot set status: name '{name}' is not registered.")
+            if session_token != row["session_token"]:
+                conn.execute("ROLLBACK")
+                raise AuthError(f"Invalid session_token for '{name}'.")
+            now_ms = _now_ms()
+            conn.execute(
+                "UPDATE agents SET status = ?, status_detail = ?, last_seen_ms = ? WHERE name = ?",
+                (status, detail, now_ms, name),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            with suppress(sqlite3.OperationalError):
+                conn.execute("ROLLBACK")
+            raise
+    return {
+        "name": name,
+        "status": status,
+        "status_detail": detail,
+        "last_seen": _ms_to_dt(now_ms).isoformat(),  # type: ignore[union-attr]
     }
 
 
@@ -712,6 +775,8 @@ def list_threads(active_within: timedelta = timedelta(hours=24)) -> list[AgentSu
                 SELECT a.name,
                        a.working_on,
                        a.last_seen_ms,
+                       a.status,
+                       a.status_detail,
                        COALESCE(m.unread_count, 0) AS unread_count
                 FROM agents a
                 LEFT JOIN (
@@ -724,6 +789,7 @@ def list_threads(active_within: timedelta = timedelta(hours=24)) -> list[AgentSu
                 """
             ).fetchall()
 
+            keys = rows[0].keys() if rows else []
             out: list[AgentSummary] = []
             for r in rows:
                 last_seen_ms = int(r["last_seen_ms"])
@@ -734,6 +800,8 @@ def list_threads(active_within: timedelta = timedelta(hours=24)) -> list[AgentSu
                         last_seen=_ms_to_dt(last_seen_ms),  # type: ignore[arg-type]
                         unread_count=r["unread_count"],
                         stale=last_seen_ms < cutoff_ms,
+                        status=r["status"] if "status" in keys else None,
+                        status_detail=r["status_detail"] if "status_detail" in keys else None,
                     )
                 )
             conn.execute("COMMIT")

@@ -19,9 +19,11 @@ from . import store
 mcp = FastMCP(
     name="dlb",
     instructions=(
-        "DLB — Dead Letter Box. Nine tools for inter-agent messaging + task lifecycle:\n"
-        "  register, recover_token, list_threads, send, read, ack, unregister,\n"
-        "  update_status, get_task_status.\n"
+        "DLB — Dead Letter Box. Ten tools for inter-agent messaging + task lifecycle:\n"
+        "  register, recover_token, set_status, list_threads, send, read, ack,\n"
+        "  unregister, update_status, get_task_status.\n"
+        "Liveness: call set_status(name, token, 'working'|'idle'|'blocked'|'done') "
+        "as you work so list_threads shows real status, not just a last_seen guess.\n"
         "Lost your session_token to context compaction? Call recover_token(name) "
         "to get it back — do NOT re-register (that mints a new token and trips "
         "the takeover gate on your own live name).\n"
@@ -48,13 +50,18 @@ def _agent_summary_dict(s: store.AgentSummary, working_on_chars: int | None = 14
     working_on = s.working_on
     if working_on and working_on_chars is not None and len(working_on) > working_on_chars:
         working_on = working_on[: working_on_chars - 1].rstrip() + "…"
-    return {
+    d: dict[str, Any] = {
         "name": s.name,
         "working_on": working_on,
         "last_seen": s.last_seen.isoformat(),
         "unread_count": s.unread_count,
         "stale": s.stale,
     }
+    if s.status is not None:
+        d["status"] = s.status
+    if s.status_detail is not None:
+        d["status_detail"] = s.status_detail
+    return d
 
 
 def _message_dict(m: store.Message) -> dict[str, Any]:
@@ -152,6 +159,34 @@ def recover_token(name: str) -> dict[str, Any] | None:
         name: The name you previously registered and want the token for.
     """
     return store.recover_token(name)
+
+
+@mcp.tool()
+def set_status(
+    name: str,
+    session_token: str,
+    status: str,
+    detail: str | None = None,
+) -> dict[str, Any]:
+    """Report your current liveness status so coordinators aren't guessing.
+
+    Convention: status ∈ {"working", "idle", "blocked", "done"} (any string is
+    accepted). `detail` is optional free text — e.g. what you're blocked on
+    (status="blocked", detail="waiting on PR #42 review"). Requires your
+    session_token. Also refreshes last_seen, so reporting status doubles as a
+    heartbeat: a coordinator reading list_threads can tell a quiet-but-alive
+    agent (recent last_seen, status "working"/"idle") from a stopped one.
+
+    Set "done" when you finish and "blocked" the moment you stall — far more
+    reliable than the last_seen staleness proxy.
+
+    Args:
+        name: Your registered name.
+        session_token: Token for `name`.
+        status: Your current status (working/idle/blocked/done by convention).
+        detail: Optional free-text detail (what you're blocked on, an ETA, …).
+    """
+    return store.set_status(name=name, session_token=session_token, status=status, detail=detail)
 
 
 @mcp.tool()
