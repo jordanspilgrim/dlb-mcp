@@ -372,10 +372,11 @@ def test_force_takeover_allowed_when_holder_stale(
     monkeypatch.setenv("DLB_TAKEOVER_AFTER_SECONDS", "0")
     r1 = store.register("alpha")
     r2 = store.register("alpha", force=True)
-    assert r2["session_token"] != r1["session_token"]
-    # Old token is now invalid
-    with pytest.raises(AuthError):
-        store.read("alpha", session_token=r1["session_token"])
+    # Deterministic tokens (v0.4.0): the token is HMAC(secret, name), invariant,
+    # so takeover returns the SAME token and the prior token still authenticates.
+    # The property under test here is that force SUCCEEDS when stale (no raise).
+    assert r2["session_token"] == r1["session_token"]
+    store.read("alpha", session_token=r1["session_token"])
 
 
 def test_force_takeover_allowed_with_matching_prior_token() -> None:
@@ -383,7 +384,9 @@ def test_force_takeover_allowed_with_matching_prior_token() -> None:
     have to wait for the stale window — passing prior_token bypasses it."""
     r1 = store.register("alpha")
     r2 = store.register("alpha", force=True, prior_token=r1["session_token"])
-    assert r2["session_token"] != r1["session_token"]
+    # Deterministic tokens (v0.4.0): invariant token, so handoff returns the same
+    # value. Property under test: prior_token bypasses the stale-gate (no raise).
+    assert r2["session_token"] == r1["session_token"]
 
 
 def test_force_takeover_denied_with_wrong_prior_token() -> None:

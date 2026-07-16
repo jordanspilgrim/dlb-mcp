@@ -25,7 +25,10 @@ against adversarial ones.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -76,6 +79,63 @@ def read_receipts_enabled() -> bool:
     """Whether reading a TASK message auto-sends a read-receipt to its sender.
     Default on; set DLB_READ_RECEIPTS=0 (or false/no) to disable globally."""
     return os.environ.get("DLB_READ_RECEIPTS", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+# ── Deterministic identity (rec #1B) ─────────────────────────────────────────
+# A session_token that is a pure function of (per-user secret, name) cannot be
+# "lost": after a restart or context compaction, re-registering the name — or
+# calling recover_token(name) — yields the SAME token, with no stored value to
+# look up. The secret is 32 random bytes on disk (chmod 600), so tokens stay
+# unguessable WITHOUT it, but any cooperating same-OS-user session (or, later,
+# any account holding the shared secret — the cross-account identity layer)
+# derives the identical token. Trade-off (owner-approved 2026-07-15): because
+# the token is invariant, a force-takeover no longer MINTS a different token or
+# invalidates the old one — acceptable under DLB's cooperative same-OS-user
+# model, where takeover reclaims a dead name rather than evicting a hostile one.
+
+
+def _secret_path() -> Path:
+    """Secret lives beside the store, so an isolated store dir → isolated secret
+    (keeps tests hermetic and lets a fleet scope its identity to one store)."""
+    return store_path().parent / "secret"
+
+
+def _get_or_create_secret() -> bytes:
+    """Read (or first-time create) the 32-byte per-store secret. Best-effort
+    chmod 600. Not cached — the store path can change between calls in tests."""
+    p = _secret_path()
+    try:
+        data = p.read_bytes()
+        if len(data) >= 32:
+            return data
+    except OSError:
+        pass
+    _ensure_store_dir()
+    secret = secrets.token_bytes(32)
+    with suppress(OSError):
+        p.write_bytes(secret)
+        p.chmod(0o600)
+    return secret
+
+
+def deterministic_token(name: str) -> str:
+    """token = HMAC-SHA256(secret, name). Stable across restart; unguessable
+    without the secret; distinct per name."""
+    return hmac.new(_get_or_create_secret(), name.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _write_token_sidecar(name: str, token: str) -> None:
+    """Persist name→token under <store_dir>/tokens/<name> (chmod 600) so a
+    SessionStart hook can rediscover which names were registered on this machine
+    and remind the agent how to recover. Best-effort — never blocks register."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:200] or "_"
+    d = store_path().parent / "tokens"
+    with suppress(OSError):
+        d.mkdir(parents=True, exist_ok=True)
+        d.chmod(0o700)
+        f = d / safe
+        f.write_text(f"{name}\n{token}\n")
+        f.chmod(0o600)
 
 
 # ── Data classes ─────────────────────────────────────────────────────────────
@@ -569,7 +629,7 @@ def register(
                         raise TakeoverDenied(name, age_seconds)
 
             now_ms = _now_ms()
-            token = secrets.token_urlsafe(32)
+            token = deterministic_token(name)
 
             if existing:
                 conn.execute(
@@ -588,6 +648,8 @@ def register(
             with suppress(sqlite3.OperationalError):
                 conn.execute("ROLLBACK")
             raise
+
+    _write_token_sidecar(name, token)
 
     now_iso = _ms_to_dt(now_ms).isoformat()  # type: ignore[union-attr]
     return {
