@@ -42,7 +42,7 @@ DEFAULT_TTL_DAYS = 7
 DEFAULT_MAX_BODY_BYTES = 256 * 1024  # 256 KiB
 DEFAULT_TAKEOVER_AFTER_SECONDS = 24 * 60 * 60  # 24h: matches list_threads' default stale window
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def store_path() -> Path:
@@ -70,6 +70,12 @@ def takeover_after_seconds() -> int:
         return v if v >= 0 else DEFAULT_TAKEOVER_AFTER_SECONDS
     except ValueError:
         return DEFAULT_TAKEOVER_AFTER_SECONDS
+
+
+def read_receipts_enabled() -> bool:
+    """Whether reading a TASK message auto-sends a read-receipt to its sender.
+    Default on; set DLB_READ_RECEIPTS=0 (or false/no) to disable globally."""
+    return os.environ.get("DLB_READ_RECEIPTS", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
 # ── Data classes ─────────────────────────────────────────────────────────────
@@ -110,6 +116,9 @@ class Message:
     status: str | None = None  # recipient-set; convention: queued/accepted/running/done/blocked
     status_note: str | None = None  # recipient-set free-text detail on status
     status_updated_at: datetime | None = None
+    # v4 field: sender-set machine-parseable one-liner, surfaced UNTRUNCATED in
+    # monitor/list previews (kills the "encode the answer in the subject" hack).
+    headline: str | None = None
 
 
 # ── Connection management ────────────────────────────────────────────────────
@@ -179,19 +188,25 @@ def init_schema() -> None:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='agents'"
             ).fetchone()
             if row is None:
-                # Truly fresh — create current schema directly.
+                # Truly fresh — create current schema directly (already v4).
                 _create_current_schema(conn)
             else:
-                # Legacy v1 DB without a user_version stamp. Migrate through v2 → v3.
+                # Legacy v1 DB without a user_version stamp. Migrate all the way up.
                 _migrate_v1_to_v2(conn)
                 _migrate_v2_to_v3(conn)
+                _migrate_v3_to_v4(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif current_version == 1:
             _migrate_v1_to_v2(conn)
             _migrate_v2_to_v3(conn)
+            _migrate_v3_to_v4(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif current_version == 2:
             _migrate_v2_to_v3(conn)
+            _migrate_v3_to_v4(conn)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        elif current_version == 3:
+            _migrate_v3_to_v4(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -226,7 +241,8 @@ def _create_current_schema(conn: sqlite3.Connection) -> None:
             in_reply_to           INTEGER,
             status                TEXT,
             status_note           TEXT,
-            status_updated_at_ms  INTEGER
+            status_updated_at_ms  INTEGER,
+            headline              TEXT
         )
         """
     )
@@ -238,6 +254,14 @@ def _create_current_schema(conn: sqlite3.Connection) -> None:
 
 # Kept for backward-compat naming — some tests may reference _create_v2_schema
 _create_v2_schema = _create_current_schema
+
+
+def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    """Additive v3 → v4: add the nullable `headline` column to messages.
+    Idempotent (guarded by a table_info probe)."""
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
+    if "headline" not in existing:
+        conn.execute("ALTER TABLE messages ADD COLUMN headline TEXT")
 
 
 def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
@@ -401,6 +425,7 @@ def _row_to_message(r: sqlite3.Row) -> Message:
         status_updated_at=(
             _ms_to_dt(r["status_updated_at_ms"]) if "status_updated_at_ms" in keys else None
         ),
+        headline=r["headline"] if "headline" in keys else None,
     )
 
 
@@ -667,6 +692,7 @@ def send(
     session_token: str | None = None,
     msg_type: str | None = None,
     in_reply_to: int | None = None,
+    headline: str | None = None,
 ) -> Message:
     """Drop a message in `to`'s inbox.
 
@@ -743,9 +769,9 @@ def send(
 
             cur = conn.execute(
                 "INSERT INTO messages (recipient_name, sender_name, subject, body, "
-                "sent_at_ms, read_at_ms, expires_at_ms, msg_type, in_reply_to) "
-                "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)",
-                (to, sender, subject, body, sent_ms, expires_ms, msg_type, in_reply_to),
+                "sent_at_ms, read_at_ms, expires_at_ms, msg_type, in_reply_to, headline) "
+                "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+                (to, sender, subject, body, sent_ms, expires_ms, msg_type, in_reply_to, headline),
             )
             msg_id = cur.lastrowid
             conn.execute("COMMIT")
@@ -765,6 +791,7 @@ def send(
         expires_at=_ms_to_dt(expires_ms),  # type: ignore[arg-type]
         msg_type=msg_type,
         in_reply_to=in_reply_to,
+        headline=headline,
     )
 
 
@@ -944,6 +971,44 @@ def read(
                     f"UPDATE messages SET read_at_ms = ? WHERE id IN ({placeholders})",
                     (mark_read_ms, *ids),
                 )
+
+            # #4 read-receipts: for each TASK message we just marked read, drop a
+            # lightweight receipt back to its sender so they learn it was seen
+            # without polling. Storm/loop guards: task-type only; a real
+            # registered recipient is reading (not a dead-letter peek); skip
+            # anonymous senders and self-sends; and receipts are msg_type=
+            # 'receipt' (never 'task') so they never generate further receipts.
+            if ids and mark_read_ms is not None and agent_row is not None and read_receipts_enabled():
+                read_iso = _ms_to_dt(mark_read_ms).isoformat()  # type: ignore[union-attr]
+                exp_ms = mark_read_ms + ttl_days() * 24 * 60 * 60 * 1000
+                id_set = set(ids)
+                for r in rows:
+                    if r["id"] not in id_set or (r["msg_type"] or "") != "task":
+                        continue
+                    origin = r["sender_name"]
+                    if origin in (None, "anonymous", name):
+                        continue
+                    # Only receipt a sender that actually holds an inbox — a
+                    # receipt to an unregistered/spoofed name is dead-letter noise.
+                    if conn.execute("SELECT 1 FROM agents WHERE name = ?", (origin,)).fetchone() is None:
+                        continue
+                    label = r["headline"] or r["subject"] or (r["body"] or "")[:60]
+                    conn.execute(
+                        "INSERT INTO messages (recipient_name, sender_name, subject, body, "
+                        "sent_at_ms, read_at_ms, expires_at_ms, msg_type, in_reply_to, headline) "
+                        "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+                        (
+                            origin,
+                            name,
+                            "✓ read",
+                            f"✓ '{label}' read by {name} at {read_iso}",
+                            mark_read_ms,
+                            exp_ms,
+                            "receipt",
+                            r["id"],
+                            f"✓ read by {name}: {label}",
+                        ),
+                    )
 
             conn.execute("COMMIT")
         except Exception:

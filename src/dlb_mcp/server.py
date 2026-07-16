@@ -76,6 +76,8 @@ def _message_dict(m: store.Message) -> dict[str, Any]:
         "sent_at": m.sent_at.isoformat(),
         "expires_at": m.expires_at.isoformat(),
     }
+    if m.headline is not None:
+        d["headline"] = m.headline
     if m.read_at:
         d["read_at"] = m.read_at.isoformat()
     if m.msg_type is not None:
@@ -207,6 +209,7 @@ def send(
     session_token: str | None = None,
     msg_type: str | None = None,
     in_reply_to: int | None = None,
+    headline: str | None = None,
 ) -> dict[str, Any]:
     """Drop a message into `to`'s inbox.
 
@@ -245,6 +248,15 @@ def send(
             behavior. See the DLB Inbox Protocol.
         in_reply_to: Optional id of the message this is replying to
             (for threading task-acknowledgment replies to the original task).
+        headline: Optional machine-parseable one-liner surfaced UNTRUNCATED in
+            monitor/list previews — read a sender's status without opening the
+            message or holding a token. Use this instead of encoding status in
+            the subject.
+
+    Read-receipts (v0.3.2+): when the recipient reads a message you sent with
+    msg_type='task' (and you sent it under a registered name), DLB drops a
+    lightweight msg_type='receipt' back into YOUR inbox so you learn it was
+    seen without polling. Disable globally with env DLB_READ_RECEIPTS=0.
     """
     msg = store.send(
         to=to,
@@ -254,6 +266,7 @@ def send(
         session_token=session_token,
         msg_type=msg_type,
         in_reply_to=in_reply_to,
+        headline=headline,
     )
     return _message_dict(msg)
 

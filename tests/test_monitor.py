@@ -69,7 +69,7 @@ def test_fetch_new_returns_only_messages_after_watermark(isolated_store: Path) -
     store.send(to="alpha", body="new", from_="bob")
     new = monitor._fetch_new(isolated_store, "alpha", baseline)
     assert len(new) == 1
-    msg_id, _sent, sender, _subject, body = new[0]
+    msg_id, _sent, sender, _subject, body, _headline = new[0]
     assert sender == "bob"
     assert body == "new"
     assert msg_id > baseline
@@ -81,7 +81,7 @@ def test_fetch_new_returns_in_arrival_order(isolated_store: Path) -> None:
     for i in range(5):
         store.send(to="alpha", body=f"m{i}", from_="x")
     new = monitor._fetch_new(isolated_store, "alpha", baseline)
-    bodies = [body for _id, _sent, _sender, _subject, body in new]
+    bodies = [body for _id, _sent, _sender, _subject, body, _hl in new]
     assert bodies == ["m0", "m1", "m2", "m3", "m4"]
 
 
@@ -153,7 +153,7 @@ def test_monitor_emits_one_line_per_new_message(isolated_store: Path) -> None:
     new = monitor._fetch_new(isolated_store, "alpha", 1)
     assert len(new) == 2
     # Confirm the pre-existing message isn't in the new set
-    bodies = {body for _id, _sent, _sender, _subject, body in new}
+    bodies = {body for _id, _sent, _sender, _subject, body, _hl in new}
     assert "pre-existing — skip me" not in bodies
     # Just for hygiene: don't leak reg
     assert reg["name"] == "alpha"
@@ -175,7 +175,7 @@ def test_monitor_include_senders_filter_drops_others(isolated_store: Path) -> No
     # thread; testing the filter logic by direct call is more deterministic).
     include = {"bob", "carol"}
     emitted = [
-        (sid, sender, body) for sid, _sent, sender, _subject, body in new if sender in include
+        (sid, sender, body) for sid, _sent, sender, _subject, body, _hl in new if sender in include
     ]
     assert {sender for _id, sender, _body in emitted} == {"bob", "carol"}
     # eve was excluded

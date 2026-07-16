@@ -63,18 +63,26 @@ def _format_event(
     subject: str | None,
     body: str,
     preview_len: int = DEFAULT_BODY_PREVIEW_LEN,
+    headline: str | None = None,
 ) -> str:
     """One-line, line-buffered event format.
 
     The leading ISO timestamp + space is a deliberate readability concession
     — Claude Code's Monitor shows the line verbatim in the notification,
     and a date prefix makes it obvious when the wake fired.
+
+    If the sender set a `headline`, it is shown UNTRUNCATED (that is the whole
+    point of the field — a machine-parseable status you can read without
+    opening the message). Otherwise we fall back to a truncated subject/body
+    snippet.
     """
     ts = datetime.fromtimestamp(sent_at_ms / 1000, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    snippet = subject if subject else body
-    snippet = snippet.replace("\n", " ").strip()
-    if len(snippet) > preview_len:
-        snippet = snippet[: preview_len - 1] + "…"
+    if headline:
+        snippet = headline.replace("\n", " ").strip()
+    else:
+        snippet = (subject if subject else body).replace("\n", " ").strip()
+        if len(snippet) > preview_len:
+            snippet = snippet[: preview_len - 1] + "…"
     return f'{ts} {sender}: "{snippet}"'
 
 
@@ -102,21 +110,28 @@ def _fetch_new(
     db_path: Path,
     recipient: str,
     since_id: int,
-) -> list[tuple[int, int, str, str | None, str]]:
-    """Return (id, sent_at_ms, sender_name, subject, body) for any message
-    in `recipient`'s inbox with id > since_id, oldest first so events fire
-    in arrival order. Empty list on error (logged, loop continues)."""
+) -> list[tuple[int, int, str, str | None, str, str | None]]:
+    """Return (id, sent_at_ms, sender_name, subject, body, headline) for any
+    message in `recipient`'s inbox with id > since_id, oldest first so events
+    fire in arrival order. Empty list on error (logged, loop continues).
+
+    `headline` is selected tolerantly — a pre-v4 store without the column
+    falls back to None rather than erroring."""
     if not db_path.exists():
         return []
     try:
         conn = sqlite3.connect(str(db_path), timeout=5.0)
         try:
+            has_headline = any(
+                r[1] == "headline" for r in conn.execute("PRAGMA table_info(messages)")
+            )
+            col = "headline" if has_headline else "NULL AS headline"
             rows = conn.execute(
-                "SELECT id, sent_at_ms, sender_name, subject, body FROM messages "
+                f"SELECT id, sent_at_ms, sender_name, subject, body, {col} FROM messages "
                 "WHERE recipient_name = ? AND id > ? ORDER BY id ASC",
                 (recipient, since_id),
             ).fetchall()
-            return [(int(r[0]), int(r[1]), r[2], r[3], r[4]) for r in rows]
+            return [(int(r[0]), int(r[1]), r[2], r[3], r[4], r[5]) for r in rows]
         finally:
             conn.close()
     except sqlite3.Error as e:
@@ -138,12 +153,12 @@ def _poll_iteration(
     in size.
     """
     new_msgs = _fetch_new(db_path, name, seen_max_id)
-    for msg_id, sent_ms, sender, subject, body in new_msgs:
+    for msg_id, sent_ms, sender, subject, body, headline in new_msgs:
         filtered = (include_senders is not None and sender not in include_senders) or (
             exclude_senders is not None and sender in exclude_senders
         )
         if not filtered:
-            line = _format_event(sent_ms, sender, subject, body)
+            line = _format_event(sent_ms, sender, subject, body, headline=headline)
             print(line, flush=True)
         # Always advance watermark — filtered messages still happened.
         seen_max_id = max(seen_max_id, msg_id)
