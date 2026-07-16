@@ -41,10 +41,13 @@ mcp = FastMCP(
 # ── Serialization helpers ────────────────────────────────────────────────────
 
 
-def _agent_summary_dict(s: store.AgentSummary) -> dict[str, Any]:
+def _agent_summary_dict(s: store.AgentSummary, working_on_chars: int | None = 140) -> dict[str, Any]:
+    working_on = s.working_on
+    if working_on and working_on_chars is not None and len(working_on) > working_on_chars:
+        working_on = working_on[: working_on_chars - 1].rstrip() + "…"
     return {
         "name": s.name,
-        "working_on": s.working_on,
+        "working_on": working_on,
         "last_seen": s.last_seen.isoformat(),
         "unread_count": s.unread_count,
         "stale": s.stale,
@@ -52,22 +55,37 @@ def _agent_summary_dict(s: store.AgentSummary) -> dict[str, Any]:
 
 
 def _message_dict(m: store.Message) -> dict[str, Any]:
-    return {
+    """Serialize a Message, OMITTING optional lifecycle fields when null.
+
+    Every message historically carried five v3 lifecycle keys
+    (msg_type/in_reply_to/status/status_note/status_updated_at) plus read_at,
+    even when all were null — dead weight on every read/send payload. We now
+    include an optional key only when it has a value, so a plain (non-task)
+    message serializes to just the six core fields. Callers should treat a
+    missing key as null (the prior explicit-null semantics).
+    """
+    d: dict[str, Any] = {
         "id": m.id,
         "recipient_name": m.recipient_name,
         "sender_name": m.sender_name,
         "subject": m.subject,
         "body": m.body,
         "sent_at": m.sent_at.isoformat(),
-        "read_at": m.read_at.isoformat() if m.read_at else None,
         "expires_at": m.expires_at.isoformat(),
-        # v3 lifecycle fields
-        "msg_type": m.msg_type,
-        "in_reply_to": m.in_reply_to,
-        "status": m.status,
-        "status_note": m.status_note,
-        "status_updated_at": (m.status_updated_at.isoformat() if m.status_updated_at else None),
     }
+    if m.read_at:
+        d["read_at"] = m.read_at.isoformat()
+    if m.msg_type is not None:
+        d["msg_type"] = m.msg_type
+    if m.in_reply_to is not None:
+        d["in_reply_to"] = m.in_reply_to
+    if m.status is not None:
+        d["status"] = m.status
+    if m.status_note is not None:
+        d["status_note"] = m.status_note
+    if m.status_updated_at is not None:
+        d["status_updated_at"] = m.status_updated_at.isoformat()
+    return d
 
 
 # ── Tools ────────────────────────────────────────────────────────────────────
@@ -111,19 +129,49 @@ def register(
 
 
 @mcp.tool()
-def list_threads(active_within_hours: int = 24) -> list[dict[str, Any]]:
-    """List all known agents with their unread counts and staleness flags.
+def list_threads(
+    active_within_hours: int = 24,
+    include_stale: bool = False,
+    only_unread: bool = False,
+    working_on_chars: int = 140,
+) -> list[dict[str, Any]]:
+    """List known agents with their unread counts and staleness flags.
 
-    No auth required. Use this to discover who's around before sending.
-    Agents whose `last_seen` is older than `active_within_hours` are marked
-    `stale=True` but still returned (so you can see "alpha was here last week").
+    No auth required. Use this to discover who's around before sending, or to
+    check who has mail waiting.
+
+    Token-efficiency defaults (v0.3.1+): to keep the payload small on a large
+    fleet, this now returns ONLY active (non-stale) agents by default, and
+    truncates each `working_on` to ~140 chars. On a store with hundreds of
+    historical agents the old behavior (return everything, full text) produced
+    thousands of tokens per call. Widen explicitly when you need to:
 
     Args:
-        active_within_hours: How many hours back to consider 'active' for
-            the staleness flag. Default 24.
+        active_within_hours: How many hours back counts as 'active' for the
+            stale flag. Default 24.
+        include_stale: If True, also return agents whose `last_seen` is older
+            than the window (the old default). Default False — stale agents
+            are omitted entirely, not just flagged.
+        only_unread: If True, return only agents with unread_count > 0
+            (answers "who has mail?" with a minimal payload). Default False.
+        working_on_chars: Truncate each `working_on` to this many chars
+            (append …). Pass 0 to omit `working_on` entirely for the leanest
+            roster; a large value to get full text. Default 140.
     """
     items = store.list_threads(active_within=timedelta(hours=active_within_hours))
-    return [_agent_summary_dict(s) for s in items]
+    if not include_stale:
+        items = [s for s in items if not s.stale]
+    if only_unread:
+        items = [s for s in items if s.unread_count > 0]
+    omit_working_on = working_on_chars <= 0
+    trunc = None if omit_working_on else working_on_chars
+    out: list[dict[str, Any]] = []
+    for s in items:
+        d = _agent_summary_dict(s, working_on_chars=trunc)
+        if omit_working_on:
+            d.pop("working_on", None)
+        out.append(d)
+    return out
 
 
 @mcp.tool()
