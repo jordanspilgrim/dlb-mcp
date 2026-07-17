@@ -1,0 +1,40 @@
+name: Publish to PyPI
+
+# Trusted publishing (OIDC) — no API token stored anywhere. Triggers on a
+# version tag (e.g. v0.5.1). ONE-TIME SETUP on PyPI before the first run:
+#   pypi.org → dlb-mcp → Manage → Publishing → Add a trusted publisher:
+#     Owner: jordanspilgrim   Repo: dlb-mcp
+#     Workflow: publish.yml    Environment: pypi
+# After that, pushing a tag `vX.Y.Z` publishes automatically.
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  test:
+    name: test before publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv venv -p 3.12 && uv sync
+      - run: uv run pytest -q
+
+  publish:
+    name: build + publish
+    needs: test
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # required for trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Build sdist + wheel
+        run: uv build
+      - name: Publish to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
