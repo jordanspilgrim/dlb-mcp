@@ -110,13 +110,14 @@ def _fetch_new(
     db_path: Path,
     recipient: str,
     since_id: int,
-) -> list[tuple[int, int, str, str | None, str, str | None]]:
-    """Return (id, sent_at_ms, sender_name, subject, body, headline) for any
+) -> list[tuple[int, int, str, str | None, str, str | None, str | None]]:
+    """Return (id, sent_at_ms, sender_name, subject, body, headline, msg_type) for any
     message in `recipient`'s inbox with id > since_id, oldest first so events
     fire in arrival order. Empty list on error (logged, loop continues).
 
     `headline` is selected tolerantly — a pre-v4 store without the column
-    falls back to None rather than erroring."""
+    falls back to None rather than erroring. `msg_type` (present since v0.3.0)
+    lets the caller suppress auto-generated receipt acks."""
     if not db_path.exists():
         return []
     try:
@@ -126,12 +127,16 @@ def _fetch_new(
                 r[1] == "headline" for r in conn.execute("PRAGMA table_info(messages)")
             )
             col = "headline" if has_headline else "NULL AS headline"
+            has_msg_type = any(
+                r[1] == "msg_type" for r in conn.execute("PRAGMA table_info(messages)")
+            )
+            mtcol = "msg_type" if has_msg_type else "NULL AS msg_type"
             rows = conn.execute(
-                f"SELECT id, sent_at_ms, sender_name, subject, body, {col} FROM messages "
+                f"SELECT id, sent_at_ms, sender_name, subject, body, {col}, {mtcol} FROM messages "
                 "WHERE recipient_name = ? AND id > ? ORDER BY id ASC",
                 (recipient, since_id),
             ).fetchall()
-            return [(int(r[0]), int(r[1]), r[2], r[3], r[4], r[5]) for r in rows]
+            return [(int(r[0]), int(r[1]), r[2], r[3], r[4], r[5], r[6]) for r in rows]
         finally:
             conn.close()
     except sqlite3.Error as e:
@@ -145,6 +150,7 @@ def _poll_iteration(
     seen_max_id: int,
     include_senders: set[str] | None,
     exclude_senders: set[str] | None,
+    emit_receipts: bool,
 ) -> int:
     """One polling tick. Returns the updated watermark.
 
@@ -153,9 +159,13 @@ def _poll_iteration(
     in size.
     """
     new_msgs = _fetch_new(db_path, name, seen_max_id)
-    for msg_id, sent_ms, sender, subject, body, headline in new_msgs:
-        filtered = (include_senders is not None and sender not in include_senders) or (
-            exclude_senders is not None and sender in exclude_senders
+    for msg_id, sent_ms, sender, subject, body, headline, msg_type in new_msgs:
+        filtered = (
+            (include_senders is not None and sender not in include_senders)
+            or (exclude_senders is not None and sender in exclude_senders)
+            # Auto-generated read-receipts are machine acks — don't wake a turn
+            # for them by default. They still sit in the inbox to be read.
+            or (msg_type == "receipt" and not emit_receipts)
         )
         if not filtered:
             line = _format_event(sent_ms, sender, subject, body, headline=headline)
@@ -170,6 +180,7 @@ def run(
     interval_seconds: float,
     include_senders: set[str] | None,
     exclude_senders: set[str] | None,
+    emit_receipts: bool = False,
 ) -> int:
     """Main poll loop. Returns exit code (0 on clean Ctrl-C).
 
@@ -202,7 +213,12 @@ def run(
         while True:
             try:
                 seen_max_id = _poll_iteration(
-                    db_path, name, seen_max_id, include_senders, exclude_senders
+                    db_path,
+                    name,
+                    seen_max_id,
+                    include_senders,
+                    exclude_senders,
+                    emit_receipts,
                 )
                 time.sleep(interval_seconds)
             except KeyboardInterrupt:
@@ -258,6 +274,15 @@ def main(argv: list[str] | None = None) -> int:
             "Comma-separated denylist of sender names. Mutually exclusive with --include-senders."
         ),
     )
+    parser.add_argument(
+        "--emit-receipts",
+        action="store_true",
+        help=(
+            "Emit an event for auto-generated read-receipt messages too. By "
+            "default receipts are suppressed so they don't wake a turn (they "
+            "still sit in the inbox to be read)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.include_senders and args.exclude_senders:
@@ -282,6 +307,7 @@ def main(argv: list[str] | None = None) -> int:
         interval_seconds=args.interval,
         include_senders=include,
         exclude_senders=exclude,
+        emit_receipts=args.emit_receipts,
     )
 
 

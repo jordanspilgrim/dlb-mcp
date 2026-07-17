@@ -6,7 +6,6 @@ import json
 
 from dlb_mcp import recover_hook, setup, store
 
-
 # ── recover_hook ─────────────────────────────────────────────────────────────
 
 

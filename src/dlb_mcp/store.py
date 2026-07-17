@@ -78,7 +78,12 @@ def takeover_after_seconds() -> int:
 def read_receipts_enabled() -> bool:
     """Whether reading a TASK message auto-sends a read-receipt to its sender.
     Default on; set DLB_READ_RECEIPTS=0 (or false/no) to disable globally."""
-    return os.environ.get("DLB_READ_RECEIPTS", "1").strip().lower() not in {"0", "false", "no", "off"}
+    return os.environ.get("DLB_READ_RECEIPTS", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 # ── Deterministic identity (rec #1B) ─────────────────────────────────────────
@@ -1108,7 +1113,12 @@ def read(
             # registered recipient is reading (not a dead-letter peek); skip
             # anonymous senders and self-sends; and receipts are msg_type=
             # 'receipt' (never 'task') so they never generate further receipts.
-            if ids and mark_read_ms is not None and agent_row is not None and read_receipts_enabled():
+            if (
+                ids
+                and mark_read_ms is not None
+                and agent_row is not None
+                and read_receipts_enabled()
+            ):
                 read_iso = _ms_to_dt(mark_read_ms).isoformat()  # type: ignore[union-attr]
                 exp_ms = mark_read_ms + ttl_days() * 24 * 60 * 60 * 1000
                 id_set = set(ids)
@@ -1120,7 +1130,10 @@ def read(
                         continue
                     # Only receipt a sender that actually holds an inbox — a
                     # receipt to an unregistered/spoofed name is dead-letter noise.
-                    if conn.execute("SELECT 1 FROM agents WHERE name = ?", (origin,)).fetchone() is None:
+                    if (
+                        conn.execute("SELECT 1 FROM agents WHERE name = ?", (origin,)).fetchone()
+                        is None
+                    ):
                         continue
                     label = r["headline"] or r["subject"] or (r["body"] or "")[:60]
                     conn.execute(

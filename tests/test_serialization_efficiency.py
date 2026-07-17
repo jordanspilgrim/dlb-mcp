@@ -9,11 +9,11 @@ rather than over the JSON-RPC transport.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from dlb_mcp import server, store
 
-_NOW = datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc)
+_NOW = datetime(2026, 7, 15, 12, 0, 0, tzinfo=UTC)
 
 
 def _msg(**overrides):
@@ -48,7 +48,14 @@ def test_message_dict_omits_null_lifecycle_fields():
 
 def test_message_dict_includes_set_lifecycle_fields():
     d = server._message_dict(
-        _msg(msg_type="task", in_reply_to=7, status="running", status_note="eta 5m", status_updated_at=_NOW, read_at=_NOW)
+        _msg(
+            msg_type="task",
+            in_reply_to=7,
+            status="running",
+            status_note="eta 5m",
+            status_updated_at=_NOW,
+            read_at=_NOW,
+        )
     )
     assert d["msg_type"] == "task"
     assert d["in_reply_to"] == 7
@@ -60,16 +67,22 @@ def test_message_dict_includes_set_lifecycle_fields():
 
 def test_agent_summary_truncates_working_on():
     long_text = "x" * 500
-    s = store.AgentSummary(name="a", working_on=long_text, last_seen=_NOW, unread_count=0, stale=False)
+    s = store.AgentSummary(
+        name="a", working_on=long_text, last_seen=_NOW, unread_count=0, stale=False
+    )
     d = server._agent_summary_dict(s, working_on_chars=140)
     assert len(d["working_on"]) <= 140
     assert d["working_on"].endswith("…")
 
 
 def test_agent_summary_no_truncation_when_short_or_disabled():
-    s = store.AgentSummary(name="a", working_on="short", last_seen=_NOW, unread_count=0, stale=False)
+    s = store.AgentSummary(
+        name="a", working_on="short", last_seen=_NOW, unread_count=0, stale=False
+    )
     assert server._agent_summary_dict(s, working_on_chars=140)["working_on"] == "short"
     # None disables truncation.
     long_text = "y" * 300
-    s2 = store.AgentSummary(name="a", working_on=long_text, last_seen=_NOW, unread_count=0, stale=False)
+    s2 = store.AgentSummary(
+        name="a", working_on=long_text, last_seen=_NOW, unread_count=0, stale=False
+    )
     assert server._agent_summary_dict(s2, working_on_chars=None)["working_on"] == long_text

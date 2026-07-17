@@ -6,7 +6,6 @@ import pytest
 
 from dlb_mcp import monitor, store
 
-
 # ── #6 headline ──────────────────────────────────────────────────────────────
 
 
@@ -36,7 +35,14 @@ def _read(name: str):
 def test_task_read_sends_receipt_to_registered_sender():
     store.register("worker")
     store.register("boss")
-    store.send(to="worker", body="do X", from_="boss", session_token=store.recover_token("boss")["session_token"], msg_type="task", headline="task: do X")
+    store.send(
+        to="worker",
+        body="do X",
+        from_="boss",
+        session_token=store.recover_token("boss")["session_token"],
+        msg_type="task",
+        headline="task: do X",
+    )
     _read("worker")
 
     receipts = _read("boss")
@@ -50,7 +56,12 @@ def test_task_read_sends_receipt_to_registered_sender():
 def test_non_task_message_does_not_receipt():
     store.register("worker")
     store.register("boss")
-    store.send(to="worker", body="fyi", from_="boss", session_token=store.recover_token("boss")["session_token"])  # no msg_type
+    store.send(
+        to="worker",
+        body="fyi",
+        from_="boss",
+        session_token=store.recover_token("boss")["session_token"],
+    )  # no msg_type
     _read("worker")
     assert _read("boss") == []
 
@@ -66,9 +77,15 @@ def test_unregistered_sender_gets_no_receipt():
 def test_receipt_does_not_generate_a_receipt_no_loop():
     store.register("worker")
     store.register("boss")
-    store.send(to="worker", body="do X", from_="boss", session_token=store.recover_token("boss")["session_token"], msg_type="task")
-    _read("worker")           # -> receipt to boss
-    _read("boss")             # reading the receipt must NOT create a new receipt to worker
+    store.send(
+        to="worker",
+        body="do X",
+        from_="boss",
+        session_token=store.recover_token("boss")["session_token"],
+        msg_type="task",
+    )
+    _read("worker")  # -> receipt to boss
+    _read("boss")  # reading the receipt must NOT create a new receipt to worker
     # worker inbox now empty (its only msg was already read); no loop receipt.
     assert _read("worker") == []
 
@@ -77,6 +94,12 @@ def test_env_opt_out_disables_receipts(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("DLB_READ_RECEIPTS", "0")
     store.register("worker")
     store.register("boss")
-    store.send(to="worker", body="do X", from_="boss", session_token=store.recover_token("boss")["session_token"], msg_type="task")
+    store.send(
+        to="worker",
+        body="do X",
+        from_="boss",
+        session_token=store.recover_token("boss")["session_token"],
+        msg_type="task",
+    )
     _read("worker")
     assert _read("boss") == []

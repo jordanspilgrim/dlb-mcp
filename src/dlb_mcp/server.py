@@ -46,7 +46,9 @@ mcp = FastMCP(
 # ── Serialization helpers ────────────────────────────────────────────────────
 
 
-def _agent_summary_dict(s: store.AgentSummary, working_on_chars: int | None = 140) -> dict[str, Any]:
+def _agent_summary_dict(
+    s: store.AgentSummary, working_on_chars: int | None = 140
+) -> dict[str, Any]:
     working_on = s.working_on
     if working_on and working_on_chars is not None and len(working_on) > working_on_chars:
         working_on = working_on[: working_on_chars - 1].rstrip() + "…"
@@ -302,9 +304,7 @@ def send(
     if body is None:
         body = content
     if body is None:
-        raise store.DLBError(
-            "send requires the message text in 'body' (or its alias 'content')."
-        )
+        raise store.DLBError("send requires the message text in 'body' (or its alias 'content').")
     msg = store.send(
         to=to,
         body=body,

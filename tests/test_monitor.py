@@ -69,7 +69,7 @@ def test_fetch_new_returns_only_messages_after_watermark(isolated_store: Path) -
     store.send(to="alpha", body="new", from_="bob")
     new = monitor._fetch_new(isolated_store, "alpha", baseline)
     assert len(new) == 1
-    msg_id, _sent, sender, _subject, body, _headline = new[0]
+    msg_id, _sent, sender, _subject, body, _headline, _mt = new[0]
     assert sender == "bob"
     assert body == "new"
     assert msg_id > baseline
@@ -81,7 +81,7 @@ def test_fetch_new_returns_in_arrival_order(isolated_store: Path) -> None:
     for i in range(5):
         store.send(to="alpha", body=f"m{i}", from_="x")
     new = monitor._fetch_new(isolated_store, "alpha", baseline)
-    bodies = [body for _id, _sent, _sender, _subject, body, _hl in new]
+    bodies = [body for _id, _sent, _sender, _subject, body, _hl, _mt in new]
     assert bodies == ["m0", "m1", "m2", "m3", "m4"]
 
 
@@ -153,7 +153,7 @@ def test_monitor_emits_one_line_per_new_message(isolated_store: Path) -> None:
     new = monitor._fetch_new(isolated_store, "alpha", 1)
     assert len(new) == 2
     # Confirm the pre-existing message isn't in the new set
-    bodies = {body for _id, _sent, _sender, _subject, body, _hl in new}
+    bodies = {body for _id, _sent, _sender, _subject, body, _hl, _mt in new}
     assert "pre-existing — skip me" not in bodies
     # Just for hygiene: don't leak reg
     assert reg["name"] == "alpha"
@@ -175,7 +175,9 @@ def test_monitor_include_senders_filter_drops_others(isolated_store: Path) -> No
     # thread; testing the filter logic by direct call is more deterministic).
     include = {"bob", "carol"}
     emitted = [
-        (sid, sender, body) for sid, _sent, sender, _subject, body, _hl in new if sender in include
+        (sid, sender, body)
+        for sid, _sent, sender, _subject, body, _hl, _mt in new
+        if sender in include
     ]
     assert {sender for _id, sender, _body in emitted} == {"bob", "carol"}
     # eve was excluded
@@ -237,7 +239,7 @@ def test_poll_iteration_advances_watermark_for_new_messages(
     store.send(to="alpha", body="m1", from_="bob")
     store.send(to="alpha", body="m2", from_="bob")
     new_watermark = monitor._poll_iteration(
-        isolated_store, "alpha", 0, include_senders=None, exclude_senders=None
+        isolated_store, "alpha", 0, include_senders=None, exclude_senders=None, emit_receipts=False
     )
     assert new_watermark == 2
 
@@ -247,7 +249,7 @@ def test_poll_iteration_returns_unchanged_watermark_for_empty_inbox(
 ) -> None:
     store.register("alpha")
     new_watermark = monitor._poll_iteration(
-        isolated_store, "alpha", 7, include_senders=None, exclude_senders=None
+        isolated_store, "alpha", 7, include_senders=None, exclude_senders=None, emit_receipts=False
     )
     # No messages → watermark unchanged (NOT reset to 0)
     assert new_watermark == 7
@@ -324,3 +326,30 @@ def test_run_loop_propagates_keyboard_interrupt_cleanly(
         exclude_senders=None,
     )
     assert exit_code == 0
+
+
+def test_monitor_suppresses_receipt_events_by_default(
+    isolated_store: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Auto-generated read-receipts must NOT emit an event by default (they
+    would wake a turn for a pure machine ack)."""
+    store.register("alpha")
+    store.send(to="alpha", body="real task", from_="bob", msg_type="task")
+    store.send(to="alpha", body="seen it", from_="carol", msg_type="receipt")
+
+    monitor._poll_iteration(isolated_store, "alpha", 0, None, None, emit_receipts=False)
+    out = capsys.readouterr().out
+    assert "real task" in out
+    assert "seen it" not in out  # receipt suppressed
+
+
+def test_monitor_emit_receipts_flag_opts_back_in(
+    isolated_store: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--emit-receipts (emit_receipts=True) restores receipt events."""
+    store.register("alpha")
+    store.send(to="alpha", body="seen it", from_="carol", msg_type="receipt")
+
+    monitor._poll_iteration(isolated_store, "alpha", 0, None, None, emit_receipts=True)
+    out = capsys.readouterr().out
+    assert "seen it" in out
