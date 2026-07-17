@@ -238,13 +238,14 @@ def list_threads(
 @mcp.tool()
 def send(
     to: str,
-    body: str,
+    body: str | None = None,
     subject: str | None = None,
     from_: str | None = None,
     session_token: str | None = None,
     msg_type: str | None = None,
     in_reply_to: int | None = None,
     headline: str | None = None,
+    content: str | None = None,
 ) -> dict[str, Any]:
     """Drop a message into `to`'s inbox.
 
@@ -292,7 +293,18 @@ def send(
     msg_type='task' (and you sent it under a registered name), DLB drops a
     lightweight msg_type='receipt' back into YOUR inbox so you learn it was
     seen without polling. Disable globally with env DLB_READ_RECEIPTS=0.
+
+    Body alias (v0.5.1+): `content` is accepted as an alias for `body`. LLM
+    callers frequently pass the message text under `content`; rather than fail
+    with a confusing "body Field required" validation error, we coalesce the
+    two here. `body` wins if both are given.
     """
+    if body is None:
+        body = content
+    if body is None:
+        raise store.DLBError(
+            "send requires the message text in 'body' (or its alias 'content')."
+        )
     msg = store.send(
         to=to,
         body=body,
