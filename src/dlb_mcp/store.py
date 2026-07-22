@@ -57,6 +57,11 @@ DEFAULT_MAX_BODY_BYTES = 256 * 1024  # 256 KiB
 # unbounded value here is pure abuse surface — `headline` in particular is
 # surfaced UNTRUNCATED into monitor previews, so a giant one floods LLM context.
 DEFAULT_MAX_FIELD_BYTES = 8 * 1024  # 8 KiB
+# Ring-buffer bound per recipient inbox: on send, if an inbox exceeds this many
+# messages, the OLDEST are dropped to make room (send still always succeeds).
+# Bounds unbounded row growth from an unauthenticated send flood; 1000 is deep
+# headroom over any real coordination inbox. Set DLB_MAX_INBOX=0 to disable.
+DEFAULT_MAX_INBOX_MESSAGES = 1000
 DEFAULT_TAKEOVER_AFTER_SECONDS = 24 * 60 * 60  # 24h: matches list_threads' default stale window
 
 SCHEMA_VERSION = 5
@@ -95,6 +100,14 @@ def max_field_bytes() -> int:
         return v if v > 0 else DEFAULT_MAX_FIELD_BYTES
     except ValueError:
         return DEFAULT_MAX_FIELD_BYTES
+
+
+def max_inbox_messages() -> int:
+    """Per-recipient inbox cap. 0 (or negative) disables the ring buffer."""
+    try:
+        return int(os.environ.get("DLB_MAX_INBOX", str(DEFAULT_MAX_INBOX_MESSAGES)))
+    except ValueError:
+        return DEFAULT_MAX_INBOX_MESSAGES
 
 
 # Control characters that must never appear in identity/metadata fields. Newlines
@@ -634,6 +647,29 @@ def _purge_expired(conn: sqlite3.Connection, *, recipient: str | None = None) ->
     return cur.rowcount
 
 
+def _enforce_inbox_cap(conn: sqlite3.Connection, recipient: str) -> int:
+    """Trim `recipient`'s inbox to the newest max_inbox_messages() rows.
+
+    Ring-buffer semantics: keeps the highest-id (newest) N messages and deletes
+    everything older. Called inside send()'s transaction after the INSERT so the
+    just-arrived message is always retained. A no-op when the cap is disabled
+    (<= 0) or the inbox is under the limit. Returns the number of rows dropped.
+
+    Trade-off (owner-chosen): under a sustained flood this can drop a real
+    queued-but-unread message. That is preferable to unbounded row growth in
+    DLB's cooperative model; raise DLB_MAX_INBOX or set it to 0 to opt out.
+    """
+    cap = max_inbox_messages()
+    if cap <= 0:
+        return 0
+    cur = conn.execute(
+        "DELETE FROM messages WHERE recipient_name = ? AND id NOT IN ("
+        "SELECT id FROM messages WHERE recipient_name = ? ORDER BY id DESC LIMIT ?)",
+        (recipient, recipient, cap),
+    )
+    return cur.rowcount
+
+
 def _suggest_alternatives(conn: sqlite3.Connection, base: str, n: int = 3) -> list[str]:
     """Generate `base-2`, `base-3`, ... skipping any already taken.
 
@@ -969,6 +1005,11 @@ def send(
       (default 8KiB) and must contain no control characters — they are surfaced
       into notifications and hook output where a newline could forge an event.
 
+    Inbox cap: send ALWAYS succeeds, but the recipient's inbox is a ring buffer
+    of at most DLB_MAX_INBOX messages (default 1000). On overflow the OLDEST
+    messages are dropped to bound row growth from a send flood — under sustained
+    flooding this can drop a real queued message. Set DLB_MAX_INBOX=0 to disable.
+
     Lifecycle hints (v0.3.0+):
     - msg_type: advisory tag. Convention: `"task"` signals to the recipient
       that this message expects action + acknowledgment. DLB does not enforce
@@ -1038,6 +1079,10 @@ def send(
                 (to, sender, subject, body, sent_ms, expires_ms, msg_type, in_reply_to, headline),
             )
             msg_id = cur.lastrowid
+            # Ring-buffer the recipient's inbox (drop oldest beyond the cap).
+            # Runs inside this txn so the message just inserted is never the one
+            # dropped. No-op when DLB_MAX_INBOX <= 0.
+            _enforce_inbox_cap(conn, to)
             conn.execute("COMMIT")
         except Exception:
             with suppress(sqlite3.OperationalError):

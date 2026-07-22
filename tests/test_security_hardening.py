@@ -188,6 +188,53 @@ def test_v1_to_v2_migration_sets_user_version_in_txn(tmp_path, monkeypatch) -> N
     assert any(m.body == "b" for m in msgs)
 
 
+# ── Issue 9: per-inbox ring-buffer cap (drop oldest) ─────────────────────────
+
+
+def test_inbox_cap_drops_oldest_and_keeps_newest(monkeypatch) -> None:
+    monkeypatch.setenv("DLB_MAX_INBOX", "5")
+    for i in range(12):
+        store.send(to="flooded", body=f"m{i}")
+    reg = store.register("flooded")
+    msgs = store.read("flooded", session_token=reg["session_token"], unread_only=False, limit=1000)
+    bodies = {m.body for m in msgs}
+    assert len(msgs) == 5, "inbox must be bounded to the cap"
+    assert bodies == {"m7", "m8", "m9", "m10", "m11"}, "newest 5 retained, oldest dropped"
+
+
+def test_inbox_cap_never_drops_the_just_sent_message(monkeypatch) -> None:
+    monkeypatch.setenv("DLB_MAX_INBOX", "1")
+    store.send(to="one", body="first")
+    m = store.send(to="one", body="second")
+    reg = store.register("one")
+    msgs = store.read("one", session_token=reg["session_token"], unread_only=False, limit=10)
+    assert [x.body for x in msgs] == ["second"]
+    assert m.body == "second"
+
+
+def test_inbox_cap_disabled_with_zero(monkeypatch) -> None:
+    monkeypatch.setenv("DLB_MAX_INBOX", "0")
+    for i in range(30):
+        store.send(to="unbounded", body=f"m{i}")
+    reg = store.register("unbounded")
+    msgs = store.read(
+        "unbounded", session_token=reg["session_token"], unread_only=False, limit=1000
+    )
+    assert len(msgs) == 30, "cap disabled → nothing dropped"
+
+
+def test_inbox_cap_is_per_recipient(monkeypatch) -> None:
+    monkeypatch.setenv("DLB_MAX_INBOX", "2")
+    for i in range(5):
+        store.send(to="a", body=f"a{i}")
+        store.send(to="b", body=f"b{i}")
+    ra = store.register("a")
+    rb = store.register("b")
+    a = store.read("a", session_token=ra["session_token"], unread_only=False, limit=100)
+    b = store.read("b", session_token=rb["session_token"], unread_only=False, limit=100)
+    assert len(a) == 2 and len(b) == 2, "cap applies independently per inbox"
+
+
 # ── Issue 8: list_threads writes under an IMMEDIATE transaction ───────────────
 
 
