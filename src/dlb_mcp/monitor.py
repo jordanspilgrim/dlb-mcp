@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -55,6 +56,21 @@ DEFAULT_BODY_PREVIEW_LEN = 80
 # tight crashloop, short enough that the user notices things are wrong within
 # a reasonable window.
 LOOP_ERROR_BACKOFF_SECONDS = 5.0
+
+
+# Any C0 control char (incl. newline, CR, tab) or DEL. Each stdout line the
+# monitor prints is a distinct Monitor wake event, so a control char in ANY
+# interpolated field — most dangerously the sender label — could forge extra
+# events or corrupt the line. store.py now rejects these at write time, but the
+# monitor reads raw SQLite (and may see legacy pre-fix rows), so it sanitizes
+# again at the sink. Defense in depth: never trust the stored value here.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _sanitize_line(s: str) -> str:
+    """Collapse control characters to single spaces so a value can't break out
+    of its one-line event slot."""
+    return _CONTROL_CHARS_RE.sub(" ", s)
 
 
 def _format_event(
@@ -75,12 +91,17 @@ def _format_event(
     point of the field — a machine-parseable status you can read without
     opening the message). Otherwise we fall back to a truncated subject/body
     snippet.
+
+    Every interpolated field is control-char-sanitized (_sanitize_line) so a
+    newline in `sender`, `headline`, `subject`, or `body` cannot forge a second
+    event line.
     """
     ts = datetime.fromtimestamp(sent_at_ms / 1000, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    sender = _sanitize_line(sender).strip()
     if headline:
-        snippet = headline.replace("\n", " ").strip()
+        snippet = _sanitize_line(headline).strip()
     else:
-        snippet = (subject if subject else body).replace("\n", " ").strip()
+        snippet = _sanitize_line(subject if subject else body).strip()
         if len(snippet) > preview_len:
             snippet = snippet[: preview_len - 1] + "…"
     return f'{ts} {sender}: "{snippet}"'
