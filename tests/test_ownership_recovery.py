@@ -297,3 +297,49 @@ def test_e2e_crash_respawn_same_session_recovers(tmp_path: Path) -> None:
     with _session(shared, session_id="S2") as foreign:
         rej = _call(foreign, 3, "recover_token", {"name": "alpha"})
         assert "_error" in rej or rej.get("_isError"), "different session must be refused"
+
+
+# ── Persisted-token reclaim after a FULL restart (bypasses the stale-gate) ────
+
+
+def test_persisted_token_reclaim_after_full_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The instant path for the case neither Design 1 nor 2 covers: a full
+    restart where the session id rotated AND the prior holder is not yet stale.
+    The returning owner reads its token from the sidecar and reclaims via
+    prior_token — which matches, so the stale-gate is bypassed."""
+    monkeypatch.setenv("DLB_TAKEOVER_AFTER_SECONDS", "1800")  # prior holder stays "live"
+    monkeypatch.setenv("DLB_SESSION_ID", "S1")
+    reg = server.register("alpha")
+    token = reg["session_token"]
+
+    # Full restart: new process (empty owned-set) AND a rotated session id.
+    server._reset_owned_names_for_tests()
+    monkeypatch.setenv("DLB_SESSION_ID", "S2")
+
+    # Neither auto path works: recover_token refused, and plain force is denied
+    # because the prior holder is not stale yet.
+    with pytest.raises(AuthError):
+        server.recover_token("alpha")
+    with pytest.raises(store.TakeoverDenied):
+        server.register("alpha", force=True)
+
+    # Persisted-token reclaim: read the token from the sidecar (line 2) and
+    # present it. It matches → instant reclaim, no stale-gate wait.
+    persisted = store.sidecar_path("alpha").read_text().splitlines()[1]
+    assert persisted == token
+    reclaimed = server.register("alpha", force=True, prior_token=persisted)
+    assert reclaimed["session_token"] == token
+    # Ownership regained → recover_token works again in this new session.
+    assert server._owns("alpha")
+    assert server.recover_token("alpha") is not None
+
+
+def test_recover_hook_documents_both_recovery_paths(capsys: pytest.CaptureFixture[str]) -> None:
+    from dlb_mcp import recover_hook
+
+    server.register("alpha")
+    recover_hook.main()
+    out = capsys.readouterr().out
+    assert "recover_token" in out  # compaction path
+    assert "force=true" in out and "prior_token" in out  # full-restart reclaim path
+    assert "- alpha" in out

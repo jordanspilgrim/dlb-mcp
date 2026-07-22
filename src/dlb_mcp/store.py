@@ -248,16 +248,36 @@ def deterministic_token(name: str) -> str:
     return hmac.new(_get_or_create_secret(), name.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def tokens_dir() -> Path:
+    """Directory holding the per-name token sidecars: <store_dir>/tokens/."""
+    return store_path().parent / "tokens"
+
+
+def _sidecar_filename(name: str) -> str:
+    """Filesystem-safe sidecar filename for a name (strips path separators and
+    other specials so a crafted name cannot escape the tokens dir)."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name)[:200] or "_"
+
+
+def sidecar_path(name: str) -> Path:
+    """Path to `name`'s token sidecar. The file (chmod 600) holds two lines:
+    the name, then its session_token. This is the persisted-token store used
+    for instant reclaim after a FULL restart: the returning owner reads its
+    token here and calls register(force=True, prior_token=<token>), which
+    bypasses the stale-gate (the token matches). Reading the file is file-layer
+    access — a peer using only the tool API cannot, which keeps the boundary."""
+    return tokens_dir() / _sidecar_filename(name)
+
+
 def _write_token_sidecar(name: str, token: str) -> None:
     """Persist name→token under <store_dir>/tokens/<name> (chmod 600) so a
     SessionStart hook can rediscover which names were registered on this machine
     and remind the agent how to recover. Best-effort — never blocks register."""
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:200] or "_"
-    d = store_path().parent / "tokens"
+    d = tokens_dir()
     with suppress(OSError):
         d.mkdir(parents=True, exist_ok=True)
         d.chmod(0o700)
-        f = d / safe
+        f = d / _sidecar_filename(name)
         f.write_text(f"{name}\n{token}\n")
         f.chmod(0o600)
 
