@@ -26,6 +26,9 @@ _HELP = (
     "  DLB_MAX_BODY_BYTES     Max message body size (default 262144 = 256 KiB)\n"
     "  DLB_MAX_FIELD_BYTES    Max metadata field size (default 8192 = 8 KiB)\n"
     "  DLB_MAX_INBOX          Per-recipient inbox cap, drop-oldest (default 1000; 0=off)\n"
+    "  DLB_SESSION_ID         Per-session id for recover_token identity (unset=off).\n"
+    "                         Wire from the harness session id (e.g.\n"
+    "                         CLAUDE_CODE_SESSION_ID); must be unique per session.\n"
 )
 
 

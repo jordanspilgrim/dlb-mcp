@@ -64,7 +64,7 @@ DEFAULT_MAX_FIELD_BYTES = 8 * 1024  # 8 KiB
 DEFAULT_MAX_INBOX_MESSAGES = 1000
 DEFAULT_TAKEOVER_AFTER_SECONDS = 24 * 60 * 60  # 24h: matches list_threads' default stale window
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def store_path() -> Path:
@@ -108,6 +108,23 @@ def max_inbox_messages() -> int:
         return int(os.environ.get("DLB_MAX_INBOX", str(DEFAULT_MAX_INBOX_MESSAGES)))
     except ValueError:
         return DEFAULT_MAX_INBOX_MESSAGES
+
+
+def current_session_id() -> str | None:
+    """The harness session id for THIS dlb-mcp process (Design 1), or None.
+
+    Read server-side from DLB_SESSION_ID — the deployment wires it from whatever
+    stable per-session id the harness exposes (e.g. CLAUDE_CODE_SESSION_ID) via
+    the MCP config `env` block or a launch wrapper. Because the server reads it
+    from its OWN environment, the caller (agent) never handles it: compaction
+    can't lose it, and a peer can't forge it by passing an argument.
+
+    MUST be unique per session for the recovery boundary to hold — a stable
+    harness session id is; two sessions sharing one value would share identity.
+    Empty/unset → None, which never matches (recovery falls back to the
+    per-process owned-set + stale-gate).
+    """
+    return os.environ.get("DLB_SESSION_ID") or None
 
 
 # Control characters that must never appear in identity/metadata fields. Newlines
@@ -358,7 +375,7 @@ def init_schema() -> None:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='agents'"
             ).fetchone()
             if row is None:
-                # Truly fresh — create current schema directly (already v5).
+                # Truly fresh — create current schema directly (already v6).
                 _create_current_schema(conn)
             else:
                 # Legacy v1 DB without a user_version stamp. Migrate all the way up.
@@ -366,24 +383,32 @@ def init_schema() -> None:
                 _migrate_v2_to_v3(conn)
                 _migrate_v3_to_v4(conn)
                 _migrate_v4_to_v5(conn)
+                _migrate_v5_to_v6(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif current_version == 1:
             _migrate_v1_to_v2(conn)
             _migrate_v2_to_v3(conn)
             _migrate_v3_to_v4(conn)
             _migrate_v4_to_v5(conn)
+            _migrate_v5_to_v6(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif current_version == 2:
             _migrate_v2_to_v3(conn)
             _migrate_v3_to_v4(conn)
             _migrate_v4_to_v5(conn)
+            _migrate_v5_to_v6(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif current_version == 3:
             _migrate_v3_to_v4(conn)
             _migrate_v4_to_v5(conn)
+            _migrate_v5_to_v6(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif current_version == 4:
             _migrate_v4_to_v5(conn)
+            _migrate_v5_to_v6(conn)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        elif current_version == 5:
+            _migrate_v5_to_v6(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -401,7 +426,8 @@ def _create_current_schema(conn: sqlite3.Connection) -> None:
             last_seen_ms      INTEGER NOT NULL,
             session_token     TEXT NOT NULL,
             status            TEXT,
-            status_detail     TEXT
+            status_detail     TEXT,
+            session_id        TEXT
         )
         """
     )
@@ -450,6 +476,16 @@ def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
     for col in ("status", "status_detail"):
         if col not in existing:
             conn.execute(f"ALTER TABLE agents ADD COLUMN {col} TEXT")
+
+
+def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
+    """Additive v5 → v6: add nullable `session_id` to agents (Design 1). Binds a
+    name to the harness session that registered it so a NEW process in the SAME
+    session (e.g. an MCP-server crash-respawn while the app stays open) can
+    recover the token without waiting out the stale-gate. Idempotent."""
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(agents)")}
+    if "session_id" not in existing:
+        conn.execute("ALTER TABLE agents ADD COLUMN session_id TEXT")
 
 
 def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
@@ -798,18 +834,22 @@ def register(
 
             now_ms = _now_ms()
             token = deterministic_token(name)
+            # Bind this registration to the current harness session (Design 1).
+            # None when DLB_SESSION_ID is unset → session-id recovery inactive.
+            sid = current_session_id()
 
             if existing:
                 conn.execute(
                     "UPDATE agents SET working_on = ?, last_seen_ms = ?, "
-                    "session_token = ? WHERE name = ?",
-                    (working_on, now_ms, token, name),
+                    "session_token = ?, session_id = ? WHERE name = ?",
+                    (working_on, now_ms, token, sid, name),
                 )
             else:
                 conn.execute(
                     "INSERT INTO agents (name, working_on, registered_at_ms, "
-                    "last_seen_ms, session_token, status) VALUES (?, ?, ?, ?, ?, ?)",
-                    (name, working_on, now_ms, now_ms, token, "working"),
+                    "last_seen_ms, session_token, status, session_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (name, working_on, now_ms, now_ms, token, "working", sid),
                 )
             conn.execute("COMMIT")
         except Exception:
@@ -881,14 +921,13 @@ def recover_token(name: str) -> dict | None:
     NOT help — it mints a NEW token and trips the takeover gate on the agent's
     own still-live name. This exposes the token directly.
 
-    Trust model: this returns a token to any caller, which is consistent with
-    DLB's stated boundary — "session_token gates the tool API, not the
-    underlying SQLite file; cooperating agents under one OS user, not
-    confidentiality." Any same-OS process can already read this token straight
-    from the SQLite file; recover_token is the sanctioned path (the raw-SQLite
-    read is what the agent safety layer blocks). Returns None if `name` is not
-    registered. Pure read — no last_seen bump; the agent's next send/read does
-    that.
+    Layering note: this store-level function is the RAW accessor and returns a
+    token to any caller. The identity boundary lives in the MCP tool wrapper
+    (server.recover_token), which only returns the token when the calling
+    session owns the name (per-process owned-set, Design 2) or its harness
+    session id matches the one bound at register (Design 1). Direct store access
+    is out of scope under DLB's trust boundary (same as reading the SQLite file).
+    Returns None if `name` is not registered. Pure read — no last_seen bump.
     """
     init_schema()
     with _connect() as conn:
@@ -904,6 +943,17 @@ def recover_token(name: str) -> dict | None:
         "session_token": row["session_token"],
         "last_seen": _ms_to_dt(int(row["last_seen_ms"])).isoformat(),  # type: ignore[union-attr]
     }
+
+
+def bound_session_id(name: str) -> str | None:
+    """The harness session id bound to `name` at its last register (Design 1),
+    or None if the name is unregistered or was registered without DLB_SESSION_ID
+    set. Used by server.recover_token to let a new process in the SAME session
+    reclaim the token without the stale-gate."""
+    init_schema()
+    with _connect() as conn:
+        row = conn.execute("SELECT session_id FROM agents WHERE name = ?", (name,)).fetchone()
+    return row["session_id"] if row is not None else None
 
 
 def list_threads(active_within: timedelta = timedelta(hours=24)) -> list[AgentSummary]:

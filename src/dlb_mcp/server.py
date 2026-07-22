@@ -198,14 +198,21 @@ def recover_token(name: str) -> dict[str, Any] | None:
     recover: register mints a brand-new token and, because your old session is
     still the live holder of the name, trips the takeover gate.
 
-    Ownership gate: recovery only works for a name THIS session (this dlb-mcp
-    process) registered. That process survives compaction, so recovery survives
-    compaction — but a DIFFERENT session cannot recover your token, and after a
-    full restart (quit+reopen, or --resume, which rotates the session) a new
-    process must reclaim the name via register(force=True) once the prior holder
-    goes stale. This closes the old hole where any caller could recover any
-    name's token. The gate covers the tool API; raw store/SQLite access is out
-    of scope (unchanged), per DLB's trust boundary.
+    Recovery is granted by either of two identity checks, in order:
+
+      1. Per-process ownership (Design 2): this dlb-mcp process registered the
+         name. The process survives context compaction, so this covers the
+         common "compaction wiped my token" case.
+      2. Harness-session match (Design 1): the name was registered under the
+         same DLB_SESSION_ID this process carries. This covers a NEW process in
+         the SAME session — e.g. the MCP server crashed and the harness
+         respawned it while the app stayed open — recovering without the
+         stale-gate. (A full restart / --resume rotates the session id, so that
+         still falls through to force + stale-gate.)
+
+    A DIFFERENT session satisfies neither → refused. This closes the old hole
+    where any caller could recover any name's token. The gate covers the tool
+    API; raw store/SQLite access is out of scope, per DLB's trust boundary.
 
     Returns None if `name` was never registered anywhere. Raises if `name` is
     registered but by a different session.
@@ -215,16 +222,23 @@ def recover_token(name: str) -> dict[str, Any] | None:
     """
     if _owns(name):
         return store.recover_token(name)
-    # Not owned by this session. Distinguish "never existed" (None, as before)
-    # from "exists but is someone else's" (a clear, actionable refusal).
+    # Design 1: same harness session (stable id across an MCP-server respawn).
+    # Both sides must be non-None and equal — an unset/None id never matches, so
+    # two sessions that both lack DLB_SESSION_ID can't recover each other.
+    sid = store.current_session_id()
+    if sid is not None and store.bound_session_id(name) == sid:
+        _mark_owned(name)  # adopt: this genuinely is the same session
+        return store.recover_token(name)
+    # Not ours. Distinguish "never existed" (None, as before) from "exists but
+    # is someone else's" (a clear, actionable refusal).
     if store.recover_token(name) is None:
         return None
     raise store.AuthError(
         f"recover_token refused: this session did not register {name!r}. "
         "recover_token only returns a token to the session that registered the "
-        "name. If you are resuming after a restart, reclaim it with "
-        "register(force=True) once the prior holder goes stale; if this is a "
-        "different agent, pick your own name."
+        "name (same process, or same DLB_SESSION_ID). If you are resuming after "
+        "a full restart, reclaim it with register(force=True) once the prior "
+        "holder goes stale; if this is a different agent, pick your own name."
     )
 
 

@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from dlb_mcp import server
+from dlb_mcp import server, store
 from dlb_mcp.store import AuthError
 
 # ── Unit layer ───────────────────────────────────────────────────────────────
@@ -114,10 +114,16 @@ def _send_rpc(proc: subprocess.Popen, messages: list[dict]) -> list[dict]:
 
 
 @contextmanager
-def _session(store_path: Path) -> Iterator[subprocess.Popen]:
-    """Spawn one dlb-mcp process (= one session) bound to a shared store."""
+def _session(store_path: Path, session_id: str | None = None) -> Iterator[subprocess.Popen]:
+    """Spawn one dlb-mcp process (= one session) bound to a shared store.
+
+    Pass session_id to set DLB_SESSION_ID (Design 1) — two processes sharing a
+    value simulate a crash-respawn within one harness session."""
     env = os.environ.copy()
     env["DLB_STORE"] = str(store_path)
+    env.pop("DLB_SESSION_ID", None)
+    if session_id is not None:
+        env["DLB_SESSION_ID"] = session_id
     proc = subprocess.Popen(
         [sys.executable, "-m", "dlb_mcp"],
         stdin=subprocess.PIPE,
@@ -221,3 +227,73 @@ def test_e2e_owner_recovers_but_foreign_session_is_refused(tmp_path: Path) -> No
         assert "_error" in read_b or read_b.get("_isError"), (
             "foreign session read alpha's inbox with a bad token"
         )
+
+
+# ── Design 1: harness-session-id recovery (survives an MCP-server respawn) ────
+
+
+def test_new_process_same_session_id_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DLB_SESSION_ID", "S1")
+    reg = server.register("alpha")
+    server._reset_owned_names_for_tests()  # new process: empty owned-set...
+    # ...but same harness session (DLB_SESSION_ID still S1) → recover via match.
+    rec = server.recover_token("alpha")
+    assert rec is not None and rec["session_token"] == reg["session_token"]
+    assert server._owns("alpha"), "ownership should be adopted on session-id match"
+
+
+def test_new_process_different_session_id_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DLB_SESSION_ID", "S1")
+    server.register("alpha")
+    server._reset_owned_names_for_tests()
+    monkeypatch.setenv("DLB_SESSION_ID", "S2")  # a different session
+    with pytest.raises(AuthError, match="did not register"):
+        server.recover_token("alpha")
+
+
+def test_no_session_id_uses_ownership_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DLB_SESSION_ID", raising=False)
+    server.register("alpha")  # bound session_id is None
+    server._reset_owned_names_for_tests()
+    with pytest.raises(AuthError):
+        server.recover_token("alpha")  # no owned-set, no session id → refused
+
+
+def test_none_bound_id_never_matches_a_set_caller_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Guard against None==None style false matches: registered without an id,
+    # a later caller WITH an id must not be able to recover.
+    monkeypatch.delenv("DLB_SESSION_ID", raising=False)
+    server.register("alpha")  # bound None
+    server._reset_owned_names_for_tests()
+    monkeypatch.setenv("DLB_SESSION_ID", "S1")
+    with pytest.raises(AuthError):
+        server.recover_token("alpha")
+
+
+def test_bound_session_id_is_persisted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DLB_SESSION_ID", "S1")
+    server.register("alpha")
+    assert store.bound_session_id("alpha") == "S1"
+
+
+def test_e2e_crash_respawn_same_session_recovers(tmp_path: Path) -> None:
+    """Design 1 over the wire: process A registers `alpha` under session S1 and
+    EXITS (simulating an MCP-server crash). A brand-new process with the SAME
+    DLB_SESSION_ID recovers the token with no stale-gate — proving recovery
+    rests on the persisted session id, not the (now-empty) in-memory owned-set.
+    A process with a DIFFERENT id is refused."""
+    shared = tmp_path / "shared.sqlite3"
+
+    with _session(shared, session_id="S1") as a:
+        reg = _call(a, 1, "register", {"name": "alpha"})
+        token = reg["session_token"]
+        assert token
+    # `a` has now exited — its process (and owned-set) is gone.
+
+    with _session(shared, session_id="S1") as respawn:
+        rec = _call(respawn, 2, "recover_token", {"name": "alpha"})
+        assert rec.get("session_token") == token, "same-session respawn must recover"
+
+    with _session(shared, session_id="S2") as foreign:
+        rej = _call(foreign, 3, "recover_token", {"name": "alpha"})
+        assert "_error" in rej or rej.get("_isError"), "different session must be refused"
