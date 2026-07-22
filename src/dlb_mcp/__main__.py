@@ -23,6 +23,9 @@ _HELP = (
     "  DLB_STORE              Path to SQLite store (default ~/.dlb/store.sqlite3)\n"
     "  DLB_MESSAGE_TTL_DAYS   Days before unread messages expire (default 7)\n"
     "  DLB_READ_RECEIPTS      0 to disable task read-receipts (default on)\n"
+    "  DLB_MAX_BODY_BYTES     Max message body size (default 262144 = 256 KiB)\n"
+    "  DLB_MAX_FIELD_BYTES    Max metadata field size (default 8192 = 8 KiB)\n"
+    "  DLB_MAX_INBOX          Per-recipient inbox cap, drop-oldest (default 1000; 0=off)\n"
 )
 
 

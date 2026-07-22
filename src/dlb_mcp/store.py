@@ -21,6 +21,15 @@ Trust boundary note: session_token gates the DLB tool API, not the underlying
 SQLite file. Any process running as the same OS user can read ~/.dlb/store.sqlite3
 directly. DLB is COORDINATION between cooperating agents, not confidentiality
 against adversarial ones.
+
+Scope of the token, precisely: because tokens are deterministic and
+`recover_token(name)` returns any name's token to any caller (see below), the
+session_token is NOT a security boundary BETWEEN distinct same-user agents — any
+agent can obtain any other agent's token through the tool API alone and then
+read its inbox, unregister it, or send messages authenticated as it. The token's
+real job is (a) letting an agent re-find its own identity after compaction and
+(b) making the "who am I" handshake explicit. Treat `sender_name` on a received
+message as an attribution HINT, not a cryptographically authenticated fact.
 """
 
 from __future__ import annotations
@@ -43,6 +52,16 @@ from pathlib import Path
 DEFAULT_STORE_PATH = Path.home() / ".dlb" / "store.sqlite3"
 DEFAULT_TTL_DAYS = 7
 DEFAULT_MAX_BODY_BYTES = 256 * 1024  # 256 KiB
+# Short metadata fields (name, to, from_, subject, headline, msg_type). The body
+# has its own, much larger cap; everything else is a one-liner-ish string and an
+# unbounded value here is pure abuse surface — `headline` in particular is
+# surfaced UNTRUNCATED into monitor previews, so a giant one floods LLM context.
+DEFAULT_MAX_FIELD_BYTES = 8 * 1024  # 8 KiB
+# Ring-buffer bound per recipient inbox: on send, if an inbox exceeds this many
+# messages, the OLDEST are dropped to make room (send still always succeeds).
+# Bounds unbounded row growth from an unauthenticated send flood; 1000 is deep
+# headroom over any real coordination inbox. Set DLB_MAX_INBOX=0 to disable.
+DEFAULT_MAX_INBOX_MESSAGES = 1000
 DEFAULT_TAKEOVER_AFTER_SECONDS = 24 * 60 * 60  # 24h: matches list_threads' default stale window
 
 SCHEMA_VERSION = 5
@@ -73,6 +92,64 @@ def takeover_after_seconds() -> int:
         return v if v >= 0 else DEFAULT_TAKEOVER_AFTER_SECONDS
     except ValueError:
         return DEFAULT_TAKEOVER_AFTER_SECONDS
+
+
+def max_field_bytes() -> int:
+    try:
+        v = int(os.environ.get("DLB_MAX_FIELD_BYTES", str(DEFAULT_MAX_FIELD_BYTES)))
+        return v if v > 0 else DEFAULT_MAX_FIELD_BYTES
+    except ValueError:
+        return DEFAULT_MAX_FIELD_BYTES
+
+
+def max_inbox_messages() -> int:
+    """Per-recipient inbox cap. 0 (or negative) disables the ring buffer."""
+    try:
+        return int(os.environ.get("DLB_MAX_INBOX", str(DEFAULT_MAX_INBOX_MESSAGES)))
+    except ValueError:
+        return DEFAULT_MAX_INBOX_MESSAGES
+
+
+# Control characters that must never appear in identity/metadata fields. Newlines
+# and carriage returns are the dangerous ones: an unsanitized value containing a
+# newline can forge a second line in a dlb-monitor notification (each stdout line
+# is a distinct wake event), letting an unauthenticated sender inject a fully
+# fabricated event with an arbitrary sender label. We reject the whole C0 control
+# range (plus DEL) at the write boundary so nothing pathological is ever stored;
+# the monitor ALSO sanitizes at its sink (defense in depth). Ordinary unicode
+# names ("alpha", "ThreadBeta", "worker-1", "ré视") are unaffected.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _check_field(value: str | None, label: str) -> None:
+    """Validate a short metadata field: size-capped and free of control chars.
+
+    No-op for None. Raises DLBError on overflow or on any embedded control
+    character (see _CONTROL_CHARS_RE). Keeps identity/preview fields safe to
+    surface into notifications and hook output without further escaping.
+    """
+    if value is None:
+        return
+    if _CONTROL_CHARS_RE.search(value):
+        raise DLBError(f"{label} must not contain control characters (newlines, tabs, etc.)")
+    n = len(value.encode("utf-8"))
+    cap = max_field_bytes()
+    if n > cap:
+        raise DLBError(f"{label} too large: {n} bytes exceeds DLB_MAX_FIELD_BYTES={cap}")
+
+
+def _tokens_equal(provided: str | None, stored: str | None) -> bool:
+    """Constant-time comparison of a provided token against the stored one.
+
+    Returns False if either side is missing rather than raising, so callers can
+    treat "no token supplied" and "wrong token" identically. hmac.compare_digest
+    avoids the early-exit timing signal of ``==`` — belt-and-suspenders here,
+    since recover_token already hands the token out under DLB's cooperative
+    model, but there is no reason to leak comparison timing on a secret.
+    """
+    if not provided or not stored:
+        return False
+    return hmac.compare_digest(provided, stored)
 
 
 def read_receipts_enabled() -> bool:
@@ -106,8 +183,16 @@ def _secret_path() -> Path:
 
 
 def _get_or_create_secret() -> bytes:
-    """Read (or first-time create) the 32-byte per-store secret. Best-effort
-    chmod 600. Not cached — the store path can change between calls in tests."""
+    """Read (or first-time create) the 32-byte per-store secret.
+
+    Creation is atomic and race-free: the candidate is written via
+    ``O_CREAT | O_EXCL``, so among N sibling agents starting against a fresh
+    store exactly ONE wins the create and every loser re-reads the winner's
+    secret. The prior implementation used a plain ``write_bytes`` (last-writer-
+    wins), which let two racers persist *different* secrets and silently diverge
+    every derived token. Mode 0o600 is set at open time. Not cached — the store
+    path can change between calls in tests.
+    """
     p = _secret_path()
     try:
         data = p.read_bytes()
@@ -117,9 +202,26 @@ def _get_or_create_secret() -> bytes:
         pass
     _ensure_store_dir()
     secret = secrets.token_bytes(32)
-    with suppress(OSError):
-        p.write_bytes(secret)
-        p.chmod(0o600)
+    try:
+        fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # Lost the create race (or a pre-existing file). Prefer the persisted
+        # secret so every process converges on one value.
+        with suppress(OSError):
+            data = p.read_bytes()
+            if len(data) >= 32:
+                return data
+        # File exists but is unreadable/short (e.g. a truncated legacy write).
+        # Don't race to overwrite a file another process may be mid-write on;
+        # fall back to an ephemeral secret for this call only.
+        return secret
+    except OSError:
+        return secret  # e.g. read-only home — ephemeral, best-effort
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(secret)
+    except OSError:
+        return secret
     return secret
 
 
@@ -447,6 +549,18 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
         conn.execute("DROP TABLE agents_v1_backup")
         conn.execute("DROP TABLE messages_v1_backup")
 
+        # 6. Stamp user_version = 2 INSIDE this transaction so the rebuild and
+        #    the version bump commit atomically. Without this, a crash after
+        #    COMMIT but before init_schema's outer `PRAGMA user_version =
+        #    SCHEMA_VERSION` would leave user_version=0 with v2-shaped tables;
+        #    the next init_schema would re-enter the v1 path, rename the v2
+        #    `agents` to backup, then `SELECT registered_at` (a v1-only column)
+        #    → "no such column" → every tool call raises. Committing the bump
+        #    with the rebuild makes the post-crash version either 1 (rolled
+        #    back) or 2 (done) — never the brick state. The additive 2→3→4→5
+        #    steps are independently idempotent.
+        conn.execute("PRAGMA user_version = 2")
+
         conn.execute("COMMIT")
     except Exception:
         with suppress(sqlite3.OperationalError):
@@ -530,6 +644,29 @@ def _purge_expired(conn: sqlite3.Connection, *, recipient: str | None = None) ->
         )
     else:
         cur = conn.execute("DELETE FROM messages WHERE expires_at_ms <= ?", (now_ms,))
+    return cur.rowcount
+
+
+def _enforce_inbox_cap(conn: sqlite3.Connection, recipient: str) -> int:
+    """Trim `recipient`'s inbox to the newest max_inbox_messages() rows.
+
+    Ring-buffer semantics: keeps the highest-id (newest) N messages and deletes
+    everything older. Called inside send()'s transaction after the INSERT so the
+    just-arrived message is always retained. A no-op when the cap is disabled
+    (<= 0) or the inbox is under the limit. Returns the number of rows dropped.
+
+    Trade-off (owner-chosen): under a sustained flood this can drop a real
+    queued-but-unread message. That is preferable to unbounded row growth in
+    DLB's cooperative model; raise DLB_MAX_INBOX or set it to 0 to opt out.
+    """
+    cap = max_inbox_messages()
+    if cap <= 0:
+        return 0
+    cur = conn.execute(
+        "DELETE FROM messages WHERE recipient_name = ? AND id NOT IN ("
+        "SELECT id FROM messages WHERE recipient_name = ? ORDER BY id DESC LIMIT ?)",
+        (recipient, recipient, cap),
+    )
     return cur.rowcount
 
 
@@ -631,6 +768,11 @@ def register(
     init_schema()
     if not name or not isinstance(name, str):
         raise DLBError("name must be a non-empty string")
+    # A name flows into sender_name on authenticated sends, into the monitor
+    # notification line, and into the SessionStart hook output — reject control
+    # chars (newline-injection) and cap the size, same as any metadata field.
+    _check_field(name, "name")
+    _check_field(working_on, "working_on")
 
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -647,7 +789,7 @@ def register(
 
             if existing and force:
                 # Gate: either prior_token must match OR holder must be stale.
-                token_matches = prior_token is not None and prior_token == existing["session_token"]
+                token_matches = _tokens_equal(prior_token, existing["session_token"])
                 if not token_matches:
                     age_seconds = (_now_ms() - int(existing["last_seen_ms"])) / 1000
                     if age_seconds < takeover_after_seconds():
@@ -699,6 +841,8 @@ def set_status(name: str, session_token: str, status: str, detail: str | None = 
     init_schema()
     if not status or not isinstance(status, str):
         raise DLBError("status must be a non-empty string")
+    _check_field(status, "status")
+    _check_field(detail, "detail")
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -708,7 +852,7 @@ def set_status(name: str, session_token: str, status: str, detail: str | None = 
             if row is None:
                 conn.execute("ROLLBACK")
                 raise DLBError(f"Cannot set status: name '{name}' is not registered.")
-            if session_token != row["session_token"]:
+            if not _tokens_equal(session_token, row["session_token"]):
                 conn.execute("ROLLBACK")
                 raise AuthError(f"Invalid session_token for '{name}'.")
             now_ms = _now_ms()
@@ -770,7 +914,12 @@ def list_threads(active_within: timedelta = timedelta(hours=24)) -> list[AgentSu
     """
     init_schema()
     with _connect() as conn:
-        conn.execute("BEGIN")
+        # IMMEDIATE, not deferred: this transaction writes (via _purge_expired's
+        # DELETE). A deferred BEGIN that upgrades to a write lock mid-transaction
+        # can raise SQLITE_BUSY under sibling contention instead of waiting on
+        # busy_timeout; acquiring the write lock up front matches every other
+        # writer here and lets busy_timeout do its job.
+        conn.execute("BEGIN IMMEDIATE")
         try:
             _purge_expired(conn)
 
@@ -835,20 +984,31 @@ def send(
     `to` is not registered. Messages queue under the name and surface when
     someone reads it.
 
-    Provenance:
+    Provenance (read this carefully — it is weaker than it looks):
     - Without session_token: `from_` is the literal string the caller passed
       (defaulting to "anonymous"). No verification — the sender label is
       free text and could be a lie.
     - With session_token: the token is looked up; if `from_` is omitted, it
       becomes the token's registered name; if `from_` is supplied, it MUST
-      equal the token's name or AuthError is raised. This means: a message
-      that claims to be from a registered name X is either authenticated
-      (token verified) or anonymous (sender_name set to whatever string,
-      callers can distinguish).
+      equal the token's name or AuthError is raised.
+    - What this does NOT give you: unforgeable provenance. Tokens are
+      deterministic and `recover_token(name)` returns any name's token to any
+      caller, so any same-user agent can obtain X's token and send a message
+      that stores sender_name=X with the token check passing. `sender_name` is
+      therefore an attribution HINT, not proof of origin. This is acceptable
+      under DLB's cooperative same-OS-user model but must not be relied on as a
+      trust boundary between distinct agents.
 
-    Size cap:
-    - body bytes (UTF-8 encoded) must be <= DLB_MAX_BODY_BYTES (default 256KiB).
-      Rejects with DLBError on overflow.
+    Size caps (all reject with DLBError on overflow):
+    - body bytes (UTF-8) must be <= DLB_MAX_BODY_BYTES (default 256KiB).
+    - to / from_ / subject / headline / msg_type each <= DLB_MAX_FIELD_BYTES
+      (default 8KiB) and must contain no control characters — they are surfaced
+      into notifications and hook output where a newline could forge an event.
+
+    Inbox cap: send ALWAYS succeeds, but the recipient's inbox is a ring buffer
+    of at most DLB_MAX_INBOX messages (default 1000). On overflow the OLDEST
+    messages are dropped to bound row growth from a send flood — under sustained
+    flooding this can drop a real queued message. Set DLB_MAX_INBOX=0 to disable.
 
     Lifecycle hints (v0.3.0+):
     - msg_type: advisory tag. Convention: `"task"` signals to the recipient
@@ -870,6 +1030,16 @@ def send(
     cap = max_body_bytes()
     if body_bytes > cap:
         raise DLBError(f"body too large: {body_bytes} bytes exceeds DLB_MAX_BODY_BYTES={cap}")
+
+    # Bound + sanitize every short metadata field. Only `body` had a cap before;
+    # subject/headline/from_/to/msg_type were unbounded (context-flood surface)
+    # and unsanitized (control chars → forged monitor events). `to` is validated
+    # for control chars only via _check_field; its non-emptiness is above.
+    _check_field(to, "to")
+    _check_field(from_, "from_")
+    _check_field(subject, "subject")
+    _check_field(headline, "headline")
+    _check_field(msg_type, "msg_type")
 
     sent_ms = _now_ms()
     expires_ms = sent_ms + ttl_days() * 24 * 60 * 60 * 1000
@@ -909,6 +1079,10 @@ def send(
                 (to, sender, subject, body, sent_ms, expires_ms, msg_type, in_reply_to, headline),
             )
             msg_id = cur.lastrowid
+            # Ring-buffer the recipient's inbox (drop oldest beyond the cap).
+            # Runs inside this txn so the message just inserted is never the one
+            # dropped. No-op when DLB_MAX_INBOX <= 0.
+            _enforce_inbox_cap(conn, to)
             conn.execute("COMMIT")
         except Exception:
             with suppress(sqlite3.OperationalError):
@@ -958,6 +1132,8 @@ def update_status(
     init_schema()
     if not status or not isinstance(status, str):
         raise DLBError("status must be a non-empty string")
+    _check_field(status, "status")
+    _check_field(note, "note")
 
     now_ms = _now_ms()
     with _connect() as conn:
@@ -981,7 +1157,7 @@ def update_status(
                     f"Cannot update_status for unregistered recipient "
                     f"'{msg_row['recipient_name']}'."
                 )
-            if session_token != agent["session_token"]:
+            if not _tokens_equal(session_token, agent["session_token"]):
                 conn.execute("ROLLBACK")
                 raise AuthError("Invalid session_token for this message's recipient.")
 
@@ -1050,12 +1226,19 @@ def read(
     unread_only: bool = True,
     limit: int = 20,
 ) -> list[Message]:
-    """Read messages for `name`. Auto-marks them read.
+    """Read messages for `name`. Marks them read ONLY for the registered owner.
 
     Auth rules:
     - If `name` IS registered: session_token must match. Otherwise AuthError.
-    - If `name` IS NOT registered: anyone can read (no owner to protect).
-      session_token is ignored in that case.
+      Messages returned are marked read (and TASK messages generate receipts).
+    - If `name` IS NOT registered: anyone can read (no owner to protect), but
+      this is a NON-DESTRUCTIVE PEEK — messages are returned WITHOUT being
+      marked read. That preserves DLB's core dead-letter guarantee: a message
+      queued for a not-yet-registered name is still unread (and still surfaced
+      by the default unread_only read + the SessionStart reminder) when the
+      intended owner finally registers. Previously any caller could peek an
+      unclaimed inbox and silently mark its queued mail read, so the real owner
+      saw nothing on arrival.
 
     Also opportunistically purges expired messages in this inbox before
     returning.
@@ -1072,9 +1255,10 @@ def read(
             agent_row = conn.execute(
                 "SELECT name, session_token FROM agents WHERE name = ?", (name,)
             ).fetchone()
+            is_owner = agent_row is not None
 
-            if agent_row is not None:
-                if session_token != agent_row["session_token"]:
+            if is_owner:
+                if not _tokens_equal(session_token, agent_row["session_token"]):
                     conn.execute("ROLLBACK")
                     raise AuthError(
                         f"Invalid or missing session_token for registered name '{name}'."
@@ -1094,12 +1278,15 @@ def read(
                 (name, limit),
             ).fetchall()
 
-            # Mark them read in the same transaction. Capture the exact ms
-            # value we write so the returned objects' read_at matches the DB
-            # to the millisecond (avoids a "stored vs. returned" drift bug).
+            # Mark read ONLY when the authenticated owner is reading. An
+            # unregistered-name peek is deliberately non-destructive (see
+            # docstring) — it leaves read_at NULL so the mail is still waiting
+            # for whoever eventually claims the name. Capture the exact ms value
+            # we write so the returned objects' read_at matches the DB to the
+            # millisecond (avoids a "stored vs. returned" drift bug).
             ids = [r["id"] for r in rows if r["read_at_ms"] is None]
             mark_read_ms: int | None = None
-            if ids:
+            if ids and is_owner:
                 mark_read_ms = _now_ms()
                 placeholders = ",".join("?" * len(ids))
                 conn.execute(
@@ -1199,7 +1386,7 @@ def ack(message_id: int, session_token: str) -> bool:
                 raise AuthError(
                     f"Cannot ack message for unregistered recipient '{msg['recipient_name']}'."
                 )
-            if session_token != agent["session_token"]:
+            if not _tokens_equal(session_token, agent["session_token"]):
                 conn.execute("ROLLBACK")
                 raise AuthError("Invalid session_token for this message's recipient.")
 
@@ -1233,7 +1420,7 @@ def unregister(name: str, session_token: str) -> bool:
             if agent is None:
                 conn.execute("ROLLBACK")
                 return False
-            if session_token != agent["session_token"]:
+            if not _tokens_equal(session_token, agent["session_token"]):
                 conn.execute("ROLLBACK")
                 raise AuthError(f"Invalid session_token for '{name}'.")
 
