@@ -88,75 +88,118 @@ def test_fetch_new_returns_in_arrival_order(isolated_store: Path) -> None:
 # ── Run loop (with a fast tick + a separate thread to inject messages) ──────
 
 
-def _run_monitor_in_thread(
-    name: str,
-    interval: float,
-    include: set[str] | None = None,
-    exclude: set[str] | None = None,
-    stop_after: float = 0.5,
-) -> tuple[list[str], threading.Thread]:
-    """Spin up monitor.run() in a background thread and capture its stdout.
+def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.01) -> bool:
+    """Poll `predicate` until it is truthy or `timeout` elapses. Returns the
+    final truthiness. Used instead of a fixed sleep so the thread-based tests
+    are deterministic (they fail loudly on timeout rather than flaky-passing
+    on a too-short sleep)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
 
-    The loop has no clean shutdown signal except KeyboardInterrupt; we wrap
-    it in a thread, redirect stdout to a list-writer, and rely on the
-    thread-local sys.stdout patch + timed test sleep for control.
+
+class _RunningMonitor:
+    """A `monitor.run()` loop on a *joinable* background thread.
+
+    History: this helper used to spawn `run()` on a `daemon=True` thread and
+    deliberately never stop it ("we live with leaving it as a daemon"),
+    because `run()` had no clean shutdown signal. That leaked an unbounded
+    poll loop across tests — and because `run()` reads the *module-global*
+    `monitor._poll_iteration` and `monitor.time.sleep` each tick, a later
+    test that monkeypatched those globals (test_run_loop_survives_...) had
+    its shared state corrupted by the leaked loop, producing a real
+    cross-test flake. `run()` now takes a `stop_event`, so the thread stops
+    cooperatively and is *joined* on context exit — no leak, no flake.
     """
-    import contextlib
-    import io
 
-    buf = io.StringIO()
-    captured: list[str] = []
-    done = threading.Event()
+    def __init__(
+        self,
+        name: str,
+        interval: float,
+        include: set[str] | None = None,
+        exclude: set[str] | None = None,
+    ) -> None:
+        import contextlib
+        import io
 
-    def target() -> None:
-        # Redirect ONLY this thread's stdout by patching sys.stdout at the
-        # process level for the brief test window. Acceptable because tests
-        # are serial.
-        with contextlib.redirect_stdout(buf):
-            try:
+        self._out = io.StringIO()
+        self._err = io.StringIO()
+        self._stop = threading.Event()
+
+        def target() -> None:
+            # redirect_* patch the process-global streams; safe here because
+            # this is the only monitor thread and it is joined before the test
+            # returns. suppress(BaseException) so a thread-side error surfaces
+            # via the captured logs / a failed assertion, never as a raw crash.
+            with (
+                contextlib.redirect_stdout(self._out),
+                contextlib.redirect_stderr(self._err),
+                contextlib.suppress(BaseException),
+            ):
                 monitor.run(
                     name=name,
                     interval_seconds=interval,
                     include_senders=include,
                     exclude_senders=exclude,
+                    stop_event=self._stop,
                 )
-            except SystemExit:
-                pass
-            except BaseException:  # noqa: BLE001 — bubble to assertion via captured logs
-                pass
-        captured.extend(buf.getvalue().splitlines())
-        done.set()
 
-    t = threading.Thread(target=target, daemon=True)
-    t.start()
-    time.sleep(stop_after)
-    # Killing a Python thread isn't possible; the monitor's loop is short and
-    # idle, so we live with leaving it as a daemon. Read what's been written.
-    captured.extend(buf.getvalue().splitlines())
-    return captured, t
+        self._thread = threading.Thread(target=target)  # non-daemon: we join it
+
+    @property
+    def out(self) -> str:
+        return self._out.getvalue()
+
+    @property
+    def err(self) -> str:
+        return self._err.getvalue()
+
+    def __enter__(self) -> _RunningMonitor:
+        self._thread.start()
+        # Block until run() has established its baseline (the "watching" line
+        # is printed to stderr right before the loop starts), so messages sent
+        # by the test are guaranteed to land ABOVE the watermark and emit.
+        assert _wait_until(lambda: "watching '" in self.err), "monitor never started"
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+        assert not self._thread.is_alive(), "monitor thread failed to stop on stop_event"
 
 
 def test_monitor_emits_one_line_per_new_message(isolated_store: Path) -> None:
-    reg = store.register("alpha")
+    store.register("alpha")
     # Pre-existing message — baseline must skip it
     store.send(to="alpha", body="pre-existing — skip me", from_="x")
 
-    captured, _ = _run_monitor_in_thread("alpha", interval=0.05, stop_after=0.0)
-    # Let the loop pass once with no new mail, then inject
-    time.sleep(0.1)
-    store.send(to="alpha", body="ping", from_="bravo")
-    store.send(to="alpha", body="pong", from_="charlie")
-    time.sleep(0.3)
-    # Re-collect output (the daemon thread keeps writing into the same buffer)
-    # captured was a snapshot; read again would require holding the buf ref.
-    # Use the API directly to verify the monitor saw the right things:
+    with _RunningMonitor("alpha", interval=0.02) as mon:
+        # Baseline established (see __enter__); now inject two new messages.
+        store.send(to="alpha", body="ping", from_="bravo")
+        store.send(to="alpha", body="pong", from_="charlie")
+        # Wait until both events have actually been emitted to stdout.
+        assert _wait_until(lambda: "bravo" in mon.out and "charlie" in mon.out), (
+            f"monitor did not emit both events; got: {mon.out!r}"
+        )
+
+    # One stdout line per NEW message — this is what the monitor's whole
+    # contract is: exactly one Monitor wake event per arriving message.
+    lines = [ln for ln in mon.out.splitlines() if ln.strip()]
+    assert len(lines) == 2, f"expected 2 event lines, got {lines!r}"
+    assert any("bravo" in ln for ln in lines)
+    assert any("charlie" in ln for ln in lines)
+    # The pre-existing message must NOT be re-surfaced (baseline skipped it).
+    assert not any("pre-existing" in ln for ln in lines)
+
+    # Belt-and-suspenders: the store-level view agrees (pre-existing excluded).
     new = monitor._fetch_new(isolated_store, "alpha", 1)
     assert len(new) == 2
-    # Confirm the pre-existing message isn't in the new set
-    bodies = {body for _id, _sent, _sender, _subject, body, _hl, _mt in new}
-    assert "pre-existing — skip me" not in bodies
-    # Just for hygiene: don't leak reg
-    assert reg["name"] == "alpha"
+    assert "pre-existing — skip me" not in {
+        body for _id, _sent, _sender, _subject, body, _hl, _mt in new
+    }
 
 
 def test_monitor_include_senders_filter_drops_others(isolated_store: Path) -> None:
