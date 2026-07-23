@@ -337,16 +337,30 @@ def test_persisted_token_reclaim_after_full_restart(monkeypatch: pytest.MonkeyPa
     with pytest.raises(store.TakeoverDenied):
         server.register("alpha", force=True)
 
-    # Persisted-token reclaim: read the token from the sidecar (line 2) and
-    # present it. It matches → instant reclaim, no stale-gate wait. The reclaim
-    # ROTATES the token (random-token eviction), so the returned token is fresh.
-    persisted = store.sidecar_path("alpha").read_text().splitlines()[1]
-    assert persisted == token
-    reclaimed = server.register("alpha", force=True, prior_token=persisted)
+    # Reclaim: read the single-use RECLAIM SECRET from the sidecar (line 2) — NOT
+    # the token — and present it. It matches reclaim_hash → instant reclaim, no
+    # stale-gate wait, and the token+secret both ROTATE.
+    secret = store.sidecar_path("alpha").read_text().splitlines()[1]
+    assert secret != token  # the sidecar never held the token
+    reclaimed = server.register("alpha", force=True, prior_token=secret)
     assert reclaimed["session_token"] != token  # rotated
     # Ownership regained → recover_token works again in this new session.
     assert server._owns("alpha")
     assert server.recover_token("alpha") is not None
+    # Single-use + tamper-evident: the OLD secret no longer reclaims (a thief who
+    # copied it before the legit owner reclaimed would now be locked out/detected).
+    server._reset_owned_names_for_tests()
+    with pytest.raises(store.TakeoverDenied):
+        server.register("alpha", force=True, prior_token=secret)
+
+
+def test_reclaim_secret_is_not_a_usable_session_token() -> None:
+    server.register("alpha")
+    secret = store.sidecar_path("alpha").read_text().splitlines()[1]
+    # The reclaim secret authenticates ONLY as prior_token for a reclaim; it is
+    # NOT a session token and must not authenticate reads/sends/etc.
+    with pytest.raises(AuthError):
+        store.read("alpha", session_token=secret)
 
 
 def test_recover_hook_documents_both_recovery_paths(capsys: pytest.CaptureFixture[str]) -> None:

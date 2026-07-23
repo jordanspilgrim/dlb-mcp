@@ -246,7 +246,8 @@ def recover_token(name: str) -> dict[str, Any] | None:
     sid = store.current_session_id()
     if sid is not None and meta["session_id"] == sid:
         new_token = store.mint_token()
-        store.rotate_token(name, new_token)  # DB gets the new hash; old token dies
+        # Rotate the reclaim secret too, so the sidecar credential stays fresh.
+        store.rotate_token(name, new_token, store.mint_token())  # old token dies
         _mark_owned(name, new_token)  # adopt + cache
         refreshed = store.agent_meta(name) or {}
         return {
@@ -362,9 +363,10 @@ def send(
     - With session_token: token is looked up. If from_ is omitted, it
       becomes the token's registered name. If from_ is supplied, it MUST
       match the token's name or AuthError is raised.
-    - This is NOT unforgeable provenance. The tool API won't hand a peer X's
-      token, but a same-user peer with RAW access (read the SQLite file or a
-      sidecar) can still obtain it and send a message stored as sender_name=X.
+    - This is NOT unforgeable provenance. No token is stored at rest, so the tool
+      API won't hand a peer X's token and a raw file read won't reveal one — the
+      most a same-user peer with raw access can do is read the sidecar's
+      single-use reclaim secret and hijack X once (which rotates it → detectable).
       Treat sender_name as an attribution HINT, not proof of origin — fine under
       DLB's cooperative same-user model, but never a trust boundary between
       distinct agents.

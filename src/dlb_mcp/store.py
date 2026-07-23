@@ -24,12 +24,17 @@ directly. DLB is COORDINATION between cooperating agents, not confidentiality
 against adversarial ones.
 
 Scope of the token, precisely: the MCP tool API never hands one session another
-session's token (recover_token is gated by per-process ownership / session-id).
-Tokens are random (not derivable) and rotate on takeover. What remains out of
-scope is RAW access — a same-user peer that reads the SQLite file or a sidecar,
-or imports the store module directly, can still obtain a token, exactly as it
-could read any of the user's files. So treat `sender_name` on a received message
-as an attribution HINT, not a cryptographically authenticated fact.
+session's token (recover_token is gated by per-process ownership / session-id),
+and NO plaintext token is stored at rest — the DB holds only sha256(token) and
+the sidecar holds a single-use, rotating RECLAIM SECRET (not the token). The live
+token lives only in the memory of the process that minted it.
+
+What remains out of scope is RAW access (reading files / importing the store).
+But even that no longer yields a usable token: the most a raw-access peer can do
+is read the sidecar's reclaim secret and reclaim a name ONCE — which rotates the
+secret, so it locks out and alerts the legitimate owner (detectable, not silent).
+So `sender_name` is still an attribution HINT rather than a cryptographically
+authenticated fact, but forging it now costs a single-use, detectable takeover.
 """
 
 from __future__ import annotations
@@ -214,25 +219,29 @@ def _sidecar_filename(name: str) -> str:
 
 
 def sidecar_path(name: str) -> Path:
-    """Path to `name`'s token sidecar. The file (chmod 600) holds two lines:
-    the name, then its session_token. This is the persisted-token store used
-    for instant reclaim after a FULL restart: the returning owner reads its
-    token here and calls register(force=True, prior_token=<token>), which
-    bypasses the stale-gate (the token matches). Reading the file is file-layer
-    access — a peer using only the tool API cannot, which keeps the boundary."""
+    """Path to `name`'s reclaim sidecar. The file (chmod 600) holds two lines:
+    the name, then the current RECLAIM SECRET (not the token). It is the instant
+    path for a FULL restart: the returning owner reads the secret and calls
+    register(force=True, prior_token=<secret>), which bypasses the stale-gate.
+
+    The secret is single-use and rotates on every register/reclaim, so a stolen
+    sidecar works at most once and is detectable (a later attempt with the same
+    secret fails). No plaintext TOKEN is ever written here. Reading the file is
+    file-layer access — out of scope for the tool-API boundary."""
     return tokens_dir() / _sidecar_filename(name)
 
 
-def _write_token_sidecar(name: str, token: str) -> None:
-    """Persist name→token under <store_dir>/tokens/<name> (chmod 600) so a
-    SessionStart hook can rediscover which names were registered on this machine
-    and remind the agent how to recover. Best-effort — never blocks register."""
+def _write_reclaim_sidecar(name: str, reclaim_secret: str) -> None:
+    """Persist name→reclaim_secret under <store_dir>/tokens/<name> (chmod 600) so
+    the SessionStart hook can rediscover registered names and a returning owner
+    can reclaim. Best-effort — never blocks register. Holds the reclaim secret,
+    NOT the token (the token is never written to disk)."""
     d = tokens_dir()
     with suppress(OSError):
         d.mkdir(parents=True, exist_ok=True)
         d.chmod(0o700)
         f = d / _sidecar_filename(name)
-        f.write_text(f"{name}\n{token}\n")
+        f.write_text(f"{name}\n{reclaim_secret}\n")
         f.chmod(0o600)
 
 
@@ -900,7 +909,7 @@ def register(
         conn.execute("BEGIN IMMEDIATE")
         try:
             existing = conn.execute(
-                "SELECT name, last_seen_ms, token_hash FROM agents WHERE name = ?",
+                "SELECT name, last_seen_ms, token_hash, reclaim_hash FROM agents WHERE name = ?",
                 (name,),
             ).fetchone()
 
@@ -910,9 +919,16 @@ def register(
                 raise NameConflict(name, suggestions)
 
             if existing and force:
-                # Gate: either prior_token must match OR holder must be stale.
-                token_matches = _auth_ok(prior_token, existing["token_hash"])
-                if not token_matches:
+                # Gate: prior_token may be the current TOKEN (a handoff) OR the
+                # rotating RECLAIM SECRET from the sidecar (a full-restart reclaim)
+                # — either bypasses the stale-gate. Otherwise the holder must be
+                # stale. Both credentials are single-use here: this register
+                # rotates them below, so a stolen sidecar works at most once and a
+                # later attempt with the same secret fails (tamper-evident).
+                proof_ok = _auth_ok(prior_token, existing["token_hash"]) or _auth_ok(
+                    prior_token, existing["reclaim_hash"]
+                )
+                if not proof_ok:
                     age_seconds = (_now_ms() - int(existing["last_seen_ms"])) / 1000
                     if age_seconds < takeover_after_seconds():
                         conn.execute("ROLLBACK")
@@ -920,6 +936,7 @@ def register(
 
             now_ms = _now_ms()
             token = mint_token()  # random; only sha256(token) is stored
+            reclaim_secret = mint_token()  # rotating single-use reclaim credential
             # Bind this registration to the current harness session (Design 1).
             # None when DLB_SESSION_ID is unset → session-id recovery inactive.
             sid = current_session_id()
@@ -927,15 +944,24 @@ def register(
             if existing:
                 conn.execute(
                     "UPDATE agents SET working_on = ?, last_seen_ms = ?, "
-                    "token_hash = ?, session_id = ? WHERE name = ?",
-                    (working_on, now_ms, token_hash(token), sid, name),
+                    "token_hash = ?, reclaim_hash = ?, session_id = ? WHERE name = ?",
+                    (working_on, now_ms, token_hash(token), token_hash(reclaim_secret), sid, name),
                 )
             else:
                 conn.execute(
                     "INSERT INTO agents (name, working_on, registered_at_ms, "
-                    "last_seen_ms, token_hash, status, session_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (name, working_on, now_ms, now_ms, token_hash(token), "working", sid),
+                    "last_seen_ms, token_hash, status, session_id, reclaim_hash) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        name,
+                        working_on,
+                        now_ms,
+                        now_ms,
+                        token_hash(token),
+                        "working",
+                        sid,
+                        token_hash(reclaim_secret),
+                    ),
                 )
             conn.execute("COMMIT")
         except Exception:
@@ -943,7 +969,9 @@ def register(
                 conn.execute("ROLLBACK")
             raise
 
-    _write_token_sidecar(name, token)
+    # The sidecar holds the RECLAIM SECRET (not the token) — a returning owner
+    # reads it and calls register(force=True, prior_token=<secret>).
+    _write_reclaim_sidecar(name, reclaim_secret)
 
     now_iso = _ms_to_dt(now_ms).isoformat()  # type: ignore[union-attr]
     return {
@@ -1025,14 +1053,15 @@ def agent_meta(name: str) -> dict | None:
     }
 
 
-def rotate_token(name: str, new_token: str, *, reclaim_secret: str | None = None) -> bool:
-    """Rotate `name`'s token to `new_token` (store its hash), bind it to the
-    current harness session, bump last_seen, and refresh the sidecar. Optionally
-    rotate the reclaim secret too. Returns False if the name is not registered.
+def rotate_token(name: str, new_token: str, new_reclaim_secret: str) -> bool:
+    """Rotate `name`'s token AND reclaim secret (store only their hashes), bind
+    to the current harness session, bump last_seen, and refresh the sidecar with
+    the new reclaim secret. Returns False if the name is not registered.
 
     Used by the server to hand a fresh token to a legitimate returning owner
-    (Design 1 crash-respawn, or a reclaim) without a plaintext token ever being
-    stored. The old token's hash is overwritten → the old token stops working.
+    (Design 1 crash-respawn) without a plaintext token ever touching disk. The
+    old hashes are overwritten → the old token and old reclaim secret both stop
+    working (rotation is what makes the reclaim credential single-use).
     """
     init_schema()
     now_ms = _now_ms()
@@ -1044,24 +1073,17 @@ def rotate_token(name: str, new_token: str, *, reclaim_secret: str | None = None
             if row is None:
                 conn.execute("ROLLBACK")
                 return False
-            if reclaim_secret is not None:
-                conn.execute(
-                    "UPDATE agents SET token_hash = ?, reclaim_hash = ?, "
-                    "session_id = ?, last_seen_ms = ? WHERE name = ?",
-                    (token_hash(new_token), token_hash(reclaim_secret), sid, now_ms, name),
-                )
-            else:
-                conn.execute(
-                    "UPDATE agents SET token_hash = ?, session_id = ?, "
-                    "last_seen_ms = ? WHERE name = ?",
-                    (token_hash(new_token), sid, now_ms, name),
-                )
+            conn.execute(
+                "UPDATE agents SET token_hash = ?, reclaim_hash = ?, "
+                "session_id = ?, last_seen_ms = ? WHERE name = ?",
+                (token_hash(new_token), token_hash(new_reclaim_secret), sid, now_ms, name),
+            )
             conn.execute("COMMIT")
         except Exception:
             with suppress(sqlite3.OperationalError):
                 conn.execute("ROLLBACK")
             raise
-    _write_token_sidecar(name, new_token)
+    _write_reclaim_sidecar(name, new_reclaim_secret)
     return True
 
 
@@ -1161,10 +1183,10 @@ def send(
     - With session_token: the token is looked up; if `from_` is omitted, it
       becomes the token's registered name; if `from_` is supplied, it MUST
       equal the token's name or AuthError is raised.
-    - What this does NOT give you: unforgeable provenance. The tool API won't
-      hand a peer X's token, but a same-user peer with RAW access (read the
-      SQLite file or a sidecar) can obtain it and send a message that stores
-      sender_name=X with the token check passing. `sender_name` is therefore an
+    - What this does NOT give you: unforgeable provenance. No token is stored at
+      rest, so a peer can't simply read one — but a same-user peer with RAW file
+      access could read the sidecar's single-use reclaim secret and hijack X
+      once (which rotates the secret → detectable). `sender_name` is therefore an
       attribution HINT, not proof of origin. Acceptable under DLB's cooperative
       same-OS-user model but never a trust boundary between distinct agents.
 

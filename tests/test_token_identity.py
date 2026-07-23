@@ -55,12 +55,17 @@ def test_force_reclaim_rotates_and_invalidates_old_token() -> None:
     assert store.read("alpha", session_token=t2) == []
 
 
-def test_register_writes_token_sidecar() -> None:
+def test_register_writes_reclaim_secret_sidecar_not_the_token() -> None:
     reg = store.register("alpha", working_on="x")
     sidecar = store.sidecar_path("alpha")
     assert sidecar.exists()
-    contents = sidecar.read_text()
-    assert "alpha" in contents
-    assert reg["session_token"] in contents
+    lines = sidecar.read_text().splitlines()
+    assert lines[0] == "alpha"
+    secret = lines[1]
+    # The sidecar holds the RECLAIM SECRET, not the token.
+    assert secret != reg["session_token"]
+    assert reg["session_token"] not in sidecar.read_text()
+    # And that secret is the one bound in the DB (its hash matches reclaim_hash).
+    assert store.agent_meta("alpha")["reclaim_hash"] == store.token_hash(secret)
     mode = sidecar.stat().st_mode & 0o077
     assert mode == 0
