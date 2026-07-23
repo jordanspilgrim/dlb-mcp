@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -153,3 +155,41 @@ def test_v1_duplicate_names_migrate_without_bricking(
     with sqlite3.connect(str(dbp)) as c:
         assert c.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
         assert c.execute("SELECT count(*) FROM agents WHERE name='dup'").fetchone()[0] == 1
+
+
+def test_concurrent_upgrade_to_newer_raises_forward_compat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex #2: if a NEWER dlb-mcp bumps the store past SCHEMA_VERSION while our
+    init_schema is blocked on BEGIN IMMEDIATE, the re-read under the lock must
+    raise the forward-compat DLBError — not treat > SCHEMA_VERSION as success.
+
+    A holder thread grabs the write lock and (uncommitted) bumps user_version to
+    SCHEMA_VERSION+1, then holds briefly. Our init_schema reads the OLD committed
+    version first (so it proceeds to BEGIN IMMEDIATE and blocks), and only after
+    the holder commits does it re-read the newer version under the lock.
+    """
+    dbp = tmp_path / "store.sqlite3"
+    monkeypatch.setenv("DLB_STORE", str(dbp))
+    store.init_schema()  # build a valid current store (WAL)
+    with sqlite3.connect(str(dbp)) as c:
+        c.execute(f"PRAGMA user_version = {store.SCHEMA_VERSION - 1}")  # look "older"
+    newer = store.SCHEMA_VERSION + 1
+
+    def hold_and_bump() -> None:
+        c = sqlite3.connect(str(dbp), timeout=5.0)
+        c.execute("PRAGMA busy_timeout = 5000")
+        c.execute("BEGIN IMMEDIATE")  # grab the write lock
+        c.execute(f"PRAGMA user_version = {newer}")  # uncommitted → not yet visible
+        time.sleep(0.4)  # hold so our init_schema blocks on BEGIN IMMEDIATE
+        c.execute("COMMIT")
+        c.close()
+
+    t = threading.Thread(target=hold_and_bump)
+    t.start()
+    try:
+        time.sleep(0.1)  # let the holder grab the lock and bump (uncommitted)
+        with pytest.raises(DLBError, match="newer than this dlb-mcp"):
+            store.init_schema()  # reads old → blocks → re-reads newer → raises
+    finally:
+        t.join(5)
