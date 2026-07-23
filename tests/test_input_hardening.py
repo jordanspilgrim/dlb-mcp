@@ -62,3 +62,25 @@ def test_list_threads_huge_active_within_is_clamped() -> None:
     server.register("a")
     # Must not raise OverflowError from timedelta(hours=10**18).
     server.list_threads(active_within_hours=10**18)
+
+
+# ── Codex review follow-ups (0.6.2) ──────────────────────────────────────────
+
+
+def test_recover_hook_prints_resolved_hashed_sidecar_path(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Codex #1: with sha256 sidecar filenames, the hook must print each name's
+    # RESOLVED path (tokens/<hash>), not the broken generic tokens/<name>.
+    from dlb_mcp import recover_hook
+
+    reg = store.register("wörker/1")
+    recover_hook.main()
+    out = capsys.readouterr().out
+    path = store.sidecar_path("wörker/1")
+    assert str(path) in out, "hook must show the resolved sidecar path"
+    assert f"{store.tokens_dir()}/wörker/1" not in out  # not the broken generic path
+    # The printed path actually locates the reclaim secret, and it reclaims.
+    secret = path.read_text().splitlines()[1]
+    reclaimed = store.register("wörker/1", force=True, prior_token=secret)
+    assert reclaimed["session_token"] != reg["session_token"]

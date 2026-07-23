@@ -259,10 +259,10 @@ def sidecar_path(name: str) -> Path:
 
 
 def _write_reclaim_sidecar(name: str, reclaim_secret: str) -> None:
-    """Persist name→reclaim_secret under <store_dir>/tokens/<name> (chmod 600) so
-    the SessionStart hook can rediscover registered names and a returning owner
-    can reclaim. Best-effort — never blocks register. Holds the reclaim secret,
-    NOT the token (the token is never written to disk)."""
+    """Persist name→reclaim_secret under <store_dir>/tokens/<sha256(name)> (chmod
+    600) so the SessionStart hook can rediscover registered names and a returning
+    owner can reclaim. Best-effort — never blocks register. Holds the reclaim
+    secret, NOT the token (the token is never written to disk)."""
     d = tokens_dir()
     with suppress(OSError):
         d.mkdir(parents=True, exist_ok=True)
@@ -400,9 +400,19 @@ def init_schema() -> None:
             # waited for the write lock. This closes the check-then-act window
             # that let concurrent callers double-run migrations and throw.
             current = conn.execute("PRAGMA user_version").fetchone()[0]
-            if current >= SCHEMA_VERSION:
+            if current == SCHEMA_VERSION:
                 conn.execute("COMMIT")
                 return
+            if current > SCHEMA_VERSION:
+                # A NEWER dlb-mcp upgraded the store while we waited for the lock.
+                # Repeat the forward-compat guard here (not just before the lock)
+                # so we raise the clear error instead of returning "success" and
+                # then leaking raw errors against an unsupported newer schema.
+                conn.execute("ROLLBACK")
+                raise DLBError(
+                    f"DLB store schema v{current} is newer than this dlb-mcp "
+                    f"(supports v{SCHEMA_VERSION}). Upgrade dlb-mcp to match."
+                )
             _apply_migrations(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.execute("COMMIT")
