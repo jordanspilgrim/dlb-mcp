@@ -69,7 +69,7 @@ DEFAULT_MAX_FIELD_BYTES = 8 * 1024  # 8 KiB
 DEFAULT_MAX_INBOX_MESSAGES = 1000
 DEFAULT_TAKEOVER_AFTER_SECONDS = 24 * 60 * 60  # 24h: matches list_threads' default stale window
 
-SCHEMA_VERSION = 7  # v7: agents store token_hash (not the token) + reclaim_hash
+SCHEMA_VERSION = 8  # v8: messages.authenticated flag + expires index
 
 
 def store_path() -> Path:
@@ -411,15 +411,17 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     _migrate_v4_to_v5(conn)
     _migrate_v5_to_v6(conn)
     _migrate_v6_to_v7(conn)
+    _migrate_v7_to_v8(conn)
 
 
 def _create_current_schema(conn: sqlite3.Connection) -> None:
-    """Create the CURRENT (v7) tables + index. Individual execute() calls (NOT
+    """Create the CURRENT (v8) tables + indexes. Individual execute() calls (NOT
     executescript) so it can run inside a caller's transaction.
 
-    v7 agents store `token_hash` (sha256 of the token) instead of the token, plus
-    `reclaim_hash` (sha256 of the rotating reclaim secret) — no plaintext token
-    at rest. Fresh DBs get this shape directly; upgrades reach it via migrations.
+    v7 agents store `token_hash`/`reclaim_hash` (no plaintext token at rest).
+    v8 messages carry an `authenticated` flag (was the send session-token-backed)
+    and an expires index for cheap TTL purges. Fresh DBs get this shape directly;
+    upgrades reach it via migrations.
     """
     conn.execute(
         """
@@ -452,7 +454,8 @@ def _create_current_schema(conn: sqlite3.Connection) -> None:
             status                TEXT,
             status_note           TEXT,
             status_updated_at_ms  INTEGER,
-            headline              TEXT
+            headline              TEXT,
+            authenticated         INTEGER
         )
         """
     )
@@ -460,6 +463,7 @@ def _create_current_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_messages_recipient "
         "ON messages(recipient_name, read_at_ms, sent_at_ms DESC)"
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at_ms)")
 
 
 def _create_v2_schema(conn: sqlite3.Connection) -> None:
@@ -581,6 +585,17 @@ def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
             ),
         )
     conn.execute("DROP TABLE agents_v6_backup")
+
+
+def _migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
+    """Additive v7 → v8: add nullable `messages.authenticated` (1 when the send
+    was backed by a valid session_token; used to gate read-receipt generation)
+    and an index on `expires_at_ms` so the lazy TTL purge is a range-delete, not
+    a full scan. Idempotent (guarded)."""
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
+    if "authenticated" not in existing:
+        conn.execute("ALTER TABLE messages ADD COLUMN authenticated INTEGER")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at_ms)")
 
 
 def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
@@ -1231,6 +1246,7 @@ def send(
         conn.execute("BEGIN IMMEDIATE")
         try:
             sender = from_ if from_ is not None else "anonymous"
+            authenticated = 0  # 1 only when a valid session_token backed the send
             if session_token is not None:
                 row = conn.execute(
                     "SELECT name FROM agents WHERE token_hash = ?",
@@ -1248,12 +1264,24 @@ def send(
                         f"or pass from_={authenticated_name!r}."
                     )
                 sender = authenticated_name
+                authenticated = 1
 
             cur = conn.execute(
                 "INSERT INTO messages (recipient_name, sender_name, subject, body, "
-                "sent_at_ms, read_at_ms, expires_at_ms, msg_type, in_reply_to, headline) "
-                "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
-                (to, sender, subject, body, sent_ms, expires_ms, msg_type, in_reply_to, headline),
+                "sent_at_ms, read_at_ms, expires_at_ms, msg_type, in_reply_to, headline, "
+                "authenticated) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)",
+                (
+                    to,
+                    sender,
+                    subject,
+                    body,
+                    sent_ms,
+                    expires_ms,
+                    msg_type,
+                    in_reply_to,
+                    headline,
+                    authenticated,
+                ),
             )
             msg_id = cur.lastrowid
             # Ring-buffer the recipient's inbox (drop oldest beyond the cap).
@@ -1473,10 +1501,15 @@ def read(
 
             # #4 read-receipts: for each TASK message we just marked read, drop a
             # lightweight receipt back to its sender so they learn it was seen
-            # without polling. Storm/loop guards: task-type only; a real
-            # registered recipient is reading (not a dead-letter peek); skip
-            # anonymous senders and self-sends; and receipts are msg_type=
-            # 'receipt' (never 'task') so they never generate further receipts.
+            # without polling. Guards: task-type only; a real registered recipient
+            # is reading (not a dead-letter peek); skip anonymous/self-sends; the
+            # ORIGINAL send must have been AUTHENTICATED (session-token-backed) —
+            # otherwise `sender_name` is a spoofable free-text `from_` and we'd
+            # author false-attribution receipts into an uninvolved agent's inbox;
+            # and receipts are msg_type='receipt' (never 'task') so they never
+            # generate further receipts. The receipt INSERTs also obey the inbox
+            # ring buffer (enforced per recipient below) — the send() path is not
+            # the only writer, so the cap must be applied here too.
             if (
                 ids
                 and mark_read_ms is not None
@@ -1486,8 +1519,13 @@ def read(
                 read_iso = _ms_to_dt(mark_read_ms).isoformat()  # type: ignore[union-attr]
                 exp_ms = mark_read_ms + ttl_days() * 24 * 60 * 60 * 1000
                 id_set = set(ids)
+                receipt_recipients: set[str] = set()
                 for r in rows:
-                    if r["id"] not in id_set or (r["msg_type"] or "") != "task":
+                    if (
+                        r["id"] not in id_set
+                        or (r["msg_type"] or "") != "task"
+                        or not r["authenticated"]
+                    ):
                         continue
                     origin = r["sender_name"]
                     if origin in (None, "anonymous", name):
@@ -1516,6 +1554,10 @@ def read(
                             f"✓ read by {name}: {label}",
                         ),
                     )
+                    receipt_recipients.add(origin)
+                # Keep the ring-buffer invariant on every inbox we just wrote to.
+                for origin in receipt_recipients:
+                    _enforce_inbox_cap(conn, origin)
 
             conn.execute("COMMIT")
         except Exception:
