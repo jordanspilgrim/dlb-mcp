@@ -76,11 +76,29 @@ def store_path() -> Path:
     return Path(os.environ.get("DLB_STORE", str(DEFAULT_STORE_PATH))).expanduser()
 
 
+# SQLite stores INTEGERs as signed 64-bit; a value at/over this overflows the
+# bind and raised a raw OverflowError from send()/etc. before it was clamped.
+_INT64_MAX = 2**63 - 1
+# Cap TTL so `sent_ms + ttl*ms_per_day` stays a valid Python datetime (year
+# <= 9999) — the return path formats expires_at via datetime.isoformat(), which
+# raises well before int64 overflow. 365,000 days ≈ 1000 years is effectively
+# "never expires" while keeping every derived timestamp representable.
+_MAX_TTL_DAYS = 365_000
+
+
 def ttl_days() -> int:
     try:
-        return int(os.environ.get("DLB_MESSAGE_TTL_DAYS", str(DEFAULT_TTL_DAYS)))
+        v = int(os.environ.get("DLB_MESSAGE_TTL_DAYS", str(DEFAULT_TTL_DAYS)))
     except ValueError:
         return DEFAULT_TTL_DAYS
+    return min(v, _MAX_TTL_DAYS)  # clamp the upper bound; negatives expire-in-past
+
+
+def _check_message_id(value: int, label: str = "message_id") -> None:
+    """Reject a message id outside SQLite's signed-64-bit range (a JSON int can
+    be arbitrarily large and would otherwise crash the bind with OverflowError)."""
+    if not isinstance(value, int) or isinstance(value, bool) or not (0 <= value <= _INT64_MAX):
+        raise DLBError(f"{label} must be an integer in [0, 2**63-1]")
 
 
 def max_body_bytes() -> int:
@@ -140,7 +158,11 @@ def current_session_id() -> str | None:
 # range (plus DEL) at the write boundary so nothing pathological is ever stored;
 # the monitor ALSO sanitizes at its sink (defense in depth). Ordinary unicode
 # names ("alpha", "ThreadBeta", "worker-1", "ré视") are unaffected.
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+# C0 controls + DEL + C1 controls (incl. NEL U+0085) + LINE/PARAGRAPH SEPARATOR.
+# The extra range beyond C0 matters because Python's str.splitlines() — and many
+# terminals/log viewers — treat NEL/U+2028/U+2029 as line boundaries, so a value
+# containing one could otherwise forge a second dlb-monitor event line.
+_CONTROL_CHARS_RE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
 
 def _check_field(value: str | None, label: str) -> None:
@@ -213,9 +235,14 @@ def tokens_dir() -> Path:
 
 
 def _sidecar_filename(name: str) -> str:
-    """Filesystem-safe sidecar filename for a name (strips path separators and
-    other specials so a crafted name cannot escape the tokens dir)."""
-    return re.sub(r"[^A-Za-z0-9._-]", "_", name)[:200] or "_"
+    """Injective, filesystem-safe sidecar filename: sha256(name) hex.
+
+    A lossy sanitizer (the old `re.sub(...)`) mapped distinct names — e.g.
+    'a/b', 'a_b', 'a b' — onto ONE file, so registering one name would clobber
+    another's reclaim credential. Hashing is collision-free and cannot escape
+    the tokens dir. The human-readable name still lives on line 1 of the file's
+    contents (read by the SessionStart hook), so nothing is lost for display."""
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()
 
 
 def sidecar_path(name: str) -> Path:
@@ -1232,6 +1259,8 @@ def send(
     _check_field(subject, "subject")
     _check_field(headline, "headline")
     _check_field(msg_type, "msg_type")
+    if in_reply_to is not None:
+        _check_message_id(in_reply_to, "in_reply_to")
 
     sent_ms = _now_ms()
     expires_ms = sent_ms + ttl_days() * 24 * 60 * 60 * 1000
@@ -1335,6 +1364,7 @@ def update_status(
     sender if desired.
     """
     init_schema()
+    _check_message_id(message_id)
     if not status or not isinstance(status, str):
         raise DLBError("status must be a non-empty string")
     _check_field(status, "status")
@@ -1400,6 +1430,7 @@ def get_task_status(message_id: int) -> dict | None:
     read.
     """
     init_schema()
+    _check_message_id(message_id)
     with _connect() as conn:
         row = conn.execute(
             "SELECT id, msg_type, in_reply_to, status, status_note, "
@@ -1585,6 +1616,7 @@ def ack(message_id: int, session_token: str) -> bool:
     no owner to take responsibility.)
     """
     init_schema()
+    _check_message_id(message_id)
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:

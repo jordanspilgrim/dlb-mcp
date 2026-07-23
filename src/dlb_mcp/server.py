@@ -324,6 +324,9 @@ def list_threads(
             (append …). Pass 0 to omit `working_on` entirely for the leanest
             roster; a large value to get full text. Default 140.
     """
+    # Clamp to a sane range so a pathological JSON int can't overflow timedelta
+    # (which raised a raw OverflowError). 10^7 hours ≈ 1141 years.
+    active_within_hours = max(0, min(int(active_within_hours), 10_000_000))
     items = store.list_threads(active_within=timedelta(hours=active_within_hours))
     if not include_stale:
         items = [s for s in items if not s.stale]
