@@ -1,6 +1,6 @@
 """Dead Letter Box — a tiny MCP server for inter-agent messaging.
 
-Six tools, no daemon, real dead-letter semantics. See README.md.
+Ten tools, no daemon, real dead-letter semantics + task lifecycle. See README.md.
 """
 
-__version__ = "0.5.2"
+__version__ = "0.6.0"
