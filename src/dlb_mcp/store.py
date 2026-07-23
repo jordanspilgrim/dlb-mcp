@@ -259,10 +259,10 @@ def sidecar_path(name: str) -> Path:
 
 
 def _write_reclaim_sidecar(name: str, reclaim_secret: str) -> None:
-    """Persist name→reclaim_secret under <store_dir>/tokens/<name> (chmod 600) so
-    the SessionStart hook can rediscover registered names and a returning owner
-    can reclaim. Best-effort — never blocks register. Holds the reclaim secret,
-    NOT the token (the token is never written to disk)."""
+    """Persist name→reclaim_secret under <store_dir>/tokens/<sha256(name)> (chmod
+    600) so the SessionStart hook can rediscover registered names and a returning
+    owner can reclaim. Best-effort — never blocks register. Holds the reclaim
+    secret, NOT the token (the token is never written to disk)."""
     d = tokens_dir()
     with suppress(OSError):
         d.mkdir(parents=True, exist_ok=True)
