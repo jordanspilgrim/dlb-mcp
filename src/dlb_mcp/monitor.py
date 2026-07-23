@@ -42,6 +42,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -202,8 +203,9 @@ def run(
     include_senders: set[str] | None,
     exclude_senders: set[str] | None,
     emit_receipts: bool = False,
+    stop_event: threading.Event | None = None,
 ) -> int:
-    """Main poll loop. Returns exit code (0 on clean Ctrl-C).
+    """Main poll loop. Returns exit code (0 on clean Ctrl-C / stop).
 
     Resilience contract: the loop MUST NOT die on a transient error.
     `_fetch_new` already swallows `sqlite3.Error` and returns []. This
@@ -212,6 +214,14 @@ def run(
     backs off, and resumes. The only paths out are KeyboardInterrupt
     (Ctrl-C → exit 0) and a real process-kill (SIGKILL → uncatchable; the
     Monitor tool reports the exit code so the LLM can re-launch).
+
+    `stop_event` is an optional cooperative shutdown signal. When supplied,
+    the loop returns 0 as soon as it is set and its inter-tick wait becomes
+    interruptible (`Event.wait` instead of `time.sleep`), so a caller that
+    embeds the monitor in a thread can stop AND join it deterministically
+    instead of leaking an unkillable daemon. `main()` (the CLI path) passes
+    no event, so the default behavior — infinite loop until Ctrl-C/SIGKILL —
+    is unchanged.
     """
     db_path = store.store_path()
     # init_schema runs migration on a legacy v1 DB so we can read *_ms
@@ -230,8 +240,17 @@ def run(
         file=sys.stderr,
     )
 
+    def _wait(seconds: float) -> bool:
+        """Sleep between ticks. With a stop_event, wait interruptibly and
+        report whether a stop was requested; otherwise fall through to the
+        plain time.sleep the CLI has always used."""
+        if stop_event is not None:
+            return stop_event.wait(seconds)
+        time.sleep(seconds)
+        return False
+
     try:
-        while True:
+        while stop_event is None or not stop_event.is_set():
             try:
                 seen_max_id = _poll_iteration(
                     db_path,
@@ -241,7 +260,8 @@ def run(
                     exclude_senders,
                     emit_receipts,
                 )
-                time.sleep(interval_seconds)
+                if _wait(interval_seconds):
+                    break
             except KeyboardInterrupt:
                 raise  # forwarded to the outer handler for clean exit
             except Exception as e:
@@ -258,7 +278,11 @@ def run(
                     f"{LOOP_ERROR_BACKOFF_SECONDS}s and continuing",
                     file=sys.stderr,
                 )
-                time.sleep(LOOP_ERROR_BACKOFF_SECONDS)
+                if _wait(LOOP_ERROR_BACKOFF_SECONDS):
+                    break
+        # Fell out of the loop because stop_event was set (cooperative stop).
+        print("dlb-monitor: stopping (stop requested)", file=sys.stderr)
+        return 0
     except KeyboardInterrupt:
         print("dlb-monitor: stopping (KeyboardInterrupt)", file=sys.stderr)
         return 0
