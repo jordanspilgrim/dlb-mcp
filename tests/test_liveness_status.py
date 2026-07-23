@@ -88,4 +88,6 @@ def test_v4_db_migrates_to_v5_with_status_columns(isolated_store: Path):
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     conn.close()
     assert "status" in cols and "status_detail" in cols
-    assert version == 5
+    # init_schema always migrates to the current schema (v6+ adds session_id);
+    # this test pins "v4 → fully migrated", so track SCHEMA_VERSION, not a literal.
+    assert version == store.SCHEMA_VERSION

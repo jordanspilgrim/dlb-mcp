@@ -102,6 +102,46 @@ def _message_dict(m: store.Message) -> dict[str, Any]:
     return d
 
 
+# ── Per-process identity ownership (Design 2: the process IS the boundary) ────
+#
+# This dlb-mcp process is spawned once per client session and lives for that
+# session's whole lifetime. Crucially it SURVIVES context compaction — compaction
+# summarizes the model's context, it does not restart this OS process. So an
+# in-memory record of "which names THIS process registered" is a per-session
+# identity that outlives the very event (compaction) that loses the token from
+# the agent's context.
+#
+# recover_token uses it to hand a token back ONLY to the session that registered
+# the name. Before, recover_token returned ANY name's token to ANY caller —
+# defeating the whole session_token gate (Issue 1). Now:
+#   • same session, post-compaction  → name is owned → token returned
+#   • a different session            → different process, empty set → refused
+#   • a brand-new process (full app restart / --resume, which rotates the
+#     session) → empty set → must reclaim via register(force=True) + stale-gate
+#
+# Scope, stated honestly: this gates the SANCTIONED tool-API path. An agent that
+# bypasses the tools entirely (`python -c "import dlb_mcp.store; ..."`, or reading
+# the SQLite file) can still obtain the token — but that is raw-store access,
+# already out of scope under DLB's trust boundary (same as reading the DB file).
+# The point is that mcp__dlb__recover_token stops being a token dispenser.
+_owned_names: set[str] = set()
+
+
+def _mark_owned(name: str) -> None:
+    _owned_names.add(name)
+
+
+def _owns(name: str) -> bool:
+    return name in _owned_names
+
+
+def _reset_owned_names_for_tests() -> None:
+    """Test hook: clear the process-global owned set. Real sessions never call
+    this (the set dies with the process); tests share one process, so they must
+    reset between cases to simulate distinct sessions."""
+    _owned_names.clear()
+
+
 # ── Tools ────────────────────────────────────────────────────────────────────
 
 
@@ -139,12 +179,18 @@ def register(
         prior_token: The current holder's session_token, if you have it.
             Lets a legitimate handoff bypass the stale-gate on force=True.
     """
-    return store.register(name, working_on=working_on, force=force, prior_token=prior_token)
+    result = store.register(name, working_on=working_on, force=force, prior_token=prior_token)
+    # This session now owns the name — recover_token will return its token to us
+    # (and only us) for the rest of this process's life, including after
+    # compaction. force-reclaim of a stale name also lands here, so a legitimate
+    # takeover gains ownership too.
+    _mark_owned(name)
+    return result
 
 
 @mcp.tool()
 def recover_token(name: str) -> dict[str, Any] | None:
-    """Re-obtain the session_token for a name you already registered.
+    """Re-obtain the session_token for a name THIS session registered.
 
     Use this when you've LOST your token — the common cause is context
     compaction wiping it from your working memory mid-session. It returns the
@@ -152,15 +198,48 @@ def recover_token(name: str) -> dict[str, Any] | None:
     recover: register mints a brand-new token and, because your old session is
     still the live holder of the name, trips the takeover gate.
 
-    No auth. This is consistent with DLB's trust model — the token already sits
-    in the SQLite store readable by any same-OS-user process; this is just the
-    sanctioned path (the raw-SQLite read is what your safety layer blocks).
-    Returns None if `name` was never registered.
+    Recovery is granted by either of two identity checks, in order:
+
+      1. Per-process ownership (Design 2): this dlb-mcp process registered the
+         name. The process survives context compaction, so this covers the
+         common "compaction wiped my token" case.
+      2. Harness-session match (Design 1): the name was registered under the
+         same DLB_SESSION_ID this process carries. This covers a NEW process in
+         the SAME session — e.g. the MCP server crashed and the harness
+         respawned it while the app stayed open — recovering without the
+         stale-gate. (A full restart / --resume rotates the session id, so that
+         still falls through to force + stale-gate.)
+
+    A DIFFERENT session satisfies neither → refused. This closes the old hole
+    where any caller could recover any name's token. The gate covers the tool
+    API; raw store/SQLite access is out of scope, per DLB's trust boundary.
+
+    Returns None if `name` was never registered anywhere. Raises if `name` is
+    registered but by a different session.
 
     Args:
         name: The name you previously registered and want the token for.
     """
-    return store.recover_token(name)
+    if _owns(name):
+        return store.recover_token(name)
+    # Design 1: same harness session (stable id across an MCP-server respawn).
+    # Both sides must be non-None and equal — an unset/None id never matches, so
+    # two sessions that both lack DLB_SESSION_ID can't recover each other.
+    sid = store.current_session_id()
+    if sid is not None and store.bound_session_id(name) == sid:
+        _mark_owned(name)  # adopt: this genuinely is the same session
+        return store.recover_token(name)
+    # Not ours. Distinguish "never existed" (None, as before) from "exists but
+    # is someone else's" (a clear, actionable refusal).
+    if store.recover_token(name) is None:
+        return None
+    raise store.AuthError(
+        f"recover_token refused: this session did not register {name!r}. "
+        "recover_token only returns a token to the session that registered the "
+        "name (same process, or same DLB_SESSION_ID). If you are resuming after "
+        "a full restart, reclaim it with register(force=True) once the prior "
+        "holder goes stale; if this is a different agent, pick your own name."
+    )
 
 
 @mcp.tool()
@@ -384,6 +463,8 @@ def unregister(name: str, session_token: str) -> dict[str, Any]:
         session_token: Must match the current holder.
     """
     ok = store.unregister(name, session_token)
+    if ok:
+        _owned_names.discard(name)  # released → this session no longer owns it
     return {"ok": ok, "name": name}
 
 

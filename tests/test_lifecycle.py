@@ -277,7 +277,8 @@ def test_v2_schema_migrates_to_v3_on_connect(isolated_store: Path) -> None:
 
     conn = sqlite3.connect(str(isolated_store))
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 5
+    # Migrates to the current schema (track SCHEMA_VERSION, not a stale literal).
+    assert version == store.SCHEMA_VERSION
 
     cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
     for expected in (
@@ -308,7 +309,7 @@ def test_v2_to_v3_migration_is_idempotent(isolated_store: Path) -> None:
     conn = sqlite3.connect(str(isolated_store))
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     conn.close()
-    assert version == 5
+    assert version == store.SCHEMA_VERSION
 
 
 def test_send_and_update_status_work_after_v2_migration(
