@@ -1075,6 +1075,7 @@ def agent_meta(name: str) -> dict | None:
         "name": row["name"],
         "working_on": row["working_on"],
         "last_seen": _ms_to_dt(int(row["last_seen_ms"])).isoformat(),  # type: ignore[union-attr]
+        "last_seen_ms": int(row["last_seen_ms"]),
         "session_id": row["session_id"],
         "token_hash": row["token_hash"],
         "reclaim_hash": row["reclaim_hash"],
@@ -1434,7 +1435,7 @@ def get_task_status(message_id: int) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
             "SELECT id, msg_type, in_reply_to, status, status_note, "
-            "status_updated_at_ms, read_at_ms, recipient_name, sender_name "
+            "status_updated_at_ms, read_at_ms "
             "FROM messages WHERE id = ?",
             (message_id,),
         ).fetchone()
@@ -1442,10 +1443,12 @@ def get_task_status(message_id: int) -> dict | None:
         return None
     read_at = _ms_to_dt(row["read_at_ms"])
     status_updated_at = _ms_to_dt(row["status_updated_at_ms"])
+    # A lightweight, auth-free status probe. It deliberately does NOT return
+    # recipient_name/sender_name (the docstring never promised them): keeping the
+    # auth-free surface to pure lifecycle status shrinks the enumeration-harvest
+    # surface (ids are sequential). Use read() for message content/parties.
     return {
         "id": row["id"],
-        "recipient_name": row["recipient_name"],
-        "sender_name": row["sender_name"],
         "msg_type": row["msg_type"],
         "in_reply_to": row["in_reply_to"],
         "status": row["status"],
