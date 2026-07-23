@@ -69,18 +69,36 @@ DEFAULT_MAX_FIELD_BYTES = 8 * 1024  # 8 KiB
 DEFAULT_MAX_INBOX_MESSAGES = 1000
 DEFAULT_TAKEOVER_AFTER_SECONDS = 24 * 60 * 60  # 24h: matches list_threads' default stale window
 
-SCHEMA_VERSION = 7  # v7: agents store token_hash (not the token) + reclaim_hash
+SCHEMA_VERSION = 8  # v8: messages.authenticated flag + expires index
 
 
 def store_path() -> Path:
     return Path(os.environ.get("DLB_STORE", str(DEFAULT_STORE_PATH))).expanduser()
 
 
+# SQLite stores INTEGERs as signed 64-bit; a value at/over this overflows the
+# bind and raised a raw OverflowError from send()/etc. before it was clamped.
+_INT64_MAX = 2**63 - 1
+# Cap TTL so `sent_ms + ttl*ms_per_day` stays a valid Python datetime (year
+# <= 9999) — the return path formats expires_at via datetime.isoformat(), which
+# raises well before int64 overflow. 365,000 days ≈ 1000 years is effectively
+# "never expires" while keeping every derived timestamp representable.
+_MAX_TTL_DAYS = 365_000
+
+
 def ttl_days() -> int:
     try:
-        return int(os.environ.get("DLB_MESSAGE_TTL_DAYS", str(DEFAULT_TTL_DAYS)))
+        v = int(os.environ.get("DLB_MESSAGE_TTL_DAYS", str(DEFAULT_TTL_DAYS)))
     except ValueError:
         return DEFAULT_TTL_DAYS
+    return min(v, _MAX_TTL_DAYS)  # clamp the upper bound; negatives expire-in-past
+
+
+def _check_message_id(value: int, label: str = "message_id") -> None:
+    """Reject a message id outside SQLite's signed-64-bit range (a JSON int can
+    be arbitrarily large and would otherwise crash the bind with OverflowError)."""
+    if not isinstance(value, int) or isinstance(value, bool) or not (0 <= value <= _INT64_MAX):
+        raise DLBError(f"{label} must be an integer in [0, 2**63-1]")
 
 
 def max_body_bytes() -> int:
@@ -140,7 +158,11 @@ def current_session_id() -> str | None:
 # range (plus DEL) at the write boundary so nothing pathological is ever stored;
 # the monitor ALSO sanitizes at its sink (defense in depth). Ordinary unicode
 # names ("alpha", "ThreadBeta", "worker-1", "ré视") are unaffected.
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+# C0 controls + DEL + C1 controls (incl. NEL U+0085) + LINE/PARAGRAPH SEPARATOR.
+# The extra range beyond C0 matters because Python's str.splitlines() — and many
+# terminals/log viewers — treat NEL/U+2028/U+2029 as line boundaries, so a value
+# containing one could otherwise forge a second dlb-monitor event line.
+_CONTROL_CHARS_RE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
 
 def _check_field(value: str | None, label: str) -> None:
@@ -213,9 +235,14 @@ def tokens_dir() -> Path:
 
 
 def _sidecar_filename(name: str) -> str:
-    """Filesystem-safe sidecar filename for a name (strips path separators and
-    other specials so a crafted name cannot escape the tokens dir)."""
-    return re.sub(r"[^A-Za-z0-9._-]", "_", name)[:200] or "_"
+    """Injective, filesystem-safe sidecar filename: sha256(name) hex.
+
+    A lossy sanitizer (the old `re.sub(...)`) mapped distinct names — e.g.
+    'a/b', 'a_b', 'a b' — onto ONE file, so registering one name would clobber
+    another's reclaim credential. Hashing is collision-free and cannot escape
+    the tokens dir. The human-readable name still lives on line 1 of the file's
+    contents (read by the SessionStart hook), so nothing is lost for display."""
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()
 
 
 def sidecar_path(name: str) -> Path:
@@ -345,72 +372,83 @@ def _connect() -> Iterator[sqlite3.Connection]:
 
 
 def init_schema() -> None:
-    """Create tables if missing; migrate through v1→v2→v3 as needed. Idempotent."""
+    """Bring the store to the current schema — atomically and race-safely.
+
+    The entire check-and-migrate runs in ONE `BEGIN IMMEDIATE` transaction with
+    double-checked locking: N concurrent processes serialize on the write lock;
+    a loser re-reads `user_version` under the lock, sees the winner already
+    migrated, and returns without running any DDL. Table creation, all
+    migrations, and the `user_version` stamp commit together, so a crash can
+    never leave a half-migrated or mis-versioned store. Idempotent.
+
+    Forward-compat: a store whose `user_version` is NEWER than this build (an
+    older dlb-mcp meeting a store a newer one upgraded) raises a clear DLBError
+    instead of letting raw `no such column` errors leak from every operation.
+    """
     with _connect() as conn:
-        current_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        current = conn.execute("PRAGMA user_version").fetchone()[0]
+        if current == SCHEMA_VERSION:
+            return
+        if current > SCHEMA_VERSION:
+            raise DLBError(
+                f"DLB store schema v{current} is newer than this dlb-mcp "
+                f"(supports v{SCHEMA_VERSION}). Upgrade dlb-mcp to match."
+            )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Re-read under the lock: another process may have migrated while we
+            # waited for the write lock. This closes the check-then-act window
+            # that let concurrent callers double-run migrations and throw.
+            current = conn.execute("PRAGMA user_version").fetchone()[0]
+            if current >= SCHEMA_VERSION:
+                conn.execute("COMMIT")
+                return
+            _apply_migrations(conn)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.execute("COMMIT")
+        except Exception:
+            with suppress(sqlite3.OperationalError):
+                conn.execute("ROLLBACK")
+            raise
 
-        if current_version >= SCHEMA_VERSION:
-            return  # already at current schema
 
-        if current_version == 0:
-            # Fresh DB OR pre-versioning v1 DB. Probe for legacy v1 tables.
-            row = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='agents'"
-            ).fetchone()
-            if row is None:
-                # Truly fresh — create current schema directly (already v7).
-                _create_current_schema(conn)
-            else:
-                # Legacy v1 DB without a user_version stamp. Migrate all the way up.
-                _migrate_v1_to_v2(conn)
-                _migrate_v2_to_v3(conn)
-                _migrate_v3_to_v4(conn)
-                _migrate_v4_to_v5(conn)
-                _migrate_v5_to_v6(conn)
-                _migrate_v6_to_v7(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif current_version == 1:
-            _migrate_v1_to_v2(conn)
-            _migrate_v2_to_v3(conn)
-            _migrate_v3_to_v4(conn)
-            _migrate_v4_to_v5(conn)
-            _migrate_v5_to_v6(conn)
-            _migrate_v6_to_v7(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif current_version == 2:
-            _migrate_v2_to_v3(conn)
-            _migrate_v3_to_v4(conn)
-            _migrate_v4_to_v5(conn)
-            _migrate_v5_to_v6(conn)
-            _migrate_v6_to_v7(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif current_version == 3:
-            _migrate_v3_to_v4(conn)
-            _migrate_v4_to_v5(conn)
-            _migrate_v5_to_v6(conn)
-            _migrate_v6_to_v7(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif current_version == 4:
-            _migrate_v4_to_v5(conn)
-            _migrate_v5_to_v6(conn)
-            _migrate_v6_to_v7(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif current_version == 5:
-            _migrate_v5_to_v6(conn)
-            _migrate_v6_to_v7(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif current_version == 6:
-            _migrate_v6_to_v7(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """Run every migration needed to reach the current schema, from ANY prior
+    state, inside the caller's (already-open) transaction.
+
+    Every step is individually idempotent (guarded by column/table probes), so
+    the full tail is safe to run from any starting shape — which also self-heals
+    a store whose tables are already modern but whose user_version is stale
+    (e.g. after a crashed fresh-init). Legacy v1 (TEXT `registered_at`) is the
+    only non-additive starting point and is detected by that column; everything
+    from v2 up is reached by the additive/rebuild steps below.
+    """
+    has_agents = (
+        conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agents'").fetchone()
+        is not None
+    )
+    if not has_agents:
+        _create_current_schema(conn)  # truly fresh DB
+        return
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(agents)")}
+    if "registered_at" in cols:  # v1 TEXT-timestamp shape (rebuild required)
+        _migrate_v1_to_v2(conn)
+    _migrate_v2_to_v3(conn)
+    _migrate_v3_to_v4(conn)
+    _migrate_v4_to_v5(conn)
+    _migrate_v5_to_v6(conn)
+    _migrate_v6_to_v7(conn)
+    _migrate_v7_to_v8(conn)
 
 
 def _create_current_schema(conn: sqlite3.Connection) -> None:
-    """Create the CURRENT (v7) tables + index. Individual execute() calls (NOT
+    """Create the CURRENT (v8) tables + indexes. Individual execute() calls (NOT
     executescript) so it can run inside a caller's transaction.
 
-    v7 agents store `token_hash` (sha256 of the token) instead of the token, plus
-    `reclaim_hash` (sha256 of the rotating reclaim secret) — no plaintext token
-    at rest. Fresh DBs get this shape directly; upgrades reach it via migrations.
+    v7 agents store `token_hash`/`reclaim_hash` (no plaintext token at rest).
+    v8 messages carry an `authenticated` flag (was the send session-token-backed)
+    and an expires index for cheap TTL purges. Fresh DBs get this shape directly;
+    upgrades reach it via migrations.
     """
     conn.execute(
         """
@@ -443,7 +481,8 @@ def _create_current_schema(conn: sqlite3.Connection) -> None:
             status                TEXT,
             status_note           TEXT,
             status_updated_at_ms  INTEGER,
-            headline              TEXT
+            headline              TEXT,
+            authenticated         INTEGER
         )
         """
     )
@@ -451,6 +490,7 @@ def _create_current_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_messages_recipient "
         "ON messages(recipient_name, read_at_ms, sent_at_ms DESC)"
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at_ms)")
 
 
 def _create_v2_schema(conn: sqlite3.Connection) -> None:
@@ -524,63 +564,65 @@ def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
     (NOT NULL) with token_hash = sha256(token), and add nullable reclaim_hash.
 
     SQLite can't drop/rename a NOT NULL column in place, so this is a table
-    rebuild (rename → create v7 → copy with hash → drop backup), stamping
-    user_version=7 INSIDE the transaction so a crash can't leave a v6-shaped
-    table at version 0/6 that re-runs the rebuild. Idempotent: a table already
-    carrying token_hash is left untouched.
+    rebuild (rename → create v7 → copy with hash → drop backup). Runs inside the
+    caller's transaction (init_schema owns the single BEGIN IMMEDIATE and stamps
+    user_version); this function manages no transaction of its own. Idempotent:
+    a table already carrying token_hash is left untouched.
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(agents)")}
     if "token_hash" in cols:
         return  # already v7-shaped
 
     conn.execute("DROP TABLE IF EXISTS agents_v6_backup")
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        conn.execute("ALTER TABLE agents RENAME TO agents_v6_backup")
-        # Create ONLY the v7 agents table here (not _create_current_schema, which
-        # also re-touches messages/index and would trip on a legacy messages
-        # shape). messages is unchanged by v7.
-        conn.execute(
-            """
-            CREATE TABLE agents (
-                name              TEXT PRIMARY KEY,
-                working_on        TEXT,
-                registered_at_ms  INTEGER NOT NULL,
-                last_seen_ms      INTEGER NOT NULL,
-                token_hash        TEXT NOT NULL,
-                status            TEXT,
-                status_detail     TEXT,
-                session_id        TEXT,
-                reclaim_hash      TEXT
-            )
-            """
+    conn.execute("ALTER TABLE agents RENAME TO agents_v6_backup")
+    # Create ONLY the v7 agents table here (not _create_current_schema, which
+    # also re-touches messages/index and would trip on a legacy messages shape).
+    conn.execute(
+        """
+        CREATE TABLE agents (
+            name              TEXT PRIMARY KEY,
+            working_on        TEXT,
+            registered_at_ms  INTEGER NOT NULL,
+            last_seen_ms      INTEGER NOT NULL,
+            token_hash        TEXT NOT NULL,
+            status            TEXT,
+            status_detail     TEXT,
+            session_id        TEXT,
+            reclaim_hash      TEXT
         )
-        for r in conn.execute(
-            "SELECT name, working_on, registered_at_ms, last_seen_ms, "
-            "session_token, status, status_detail, session_id FROM agents_v6_backup"
-        ).fetchall():
-            conn.execute(
-                "INSERT INTO agents (name, working_on, registered_at_ms, "
-                "last_seen_ms, token_hash, status, status_detail, session_id, "
-                "reclaim_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
-                (
-                    r["name"],
-                    r["working_on"],
-                    r["registered_at_ms"],
-                    r["last_seen_ms"],
-                    token_hash(r["session_token"]),
-                    r["status"],
-                    r["status_detail"],
-                    r["session_id"],
-                ),
-            )
-        conn.execute("DROP TABLE agents_v6_backup")
-        conn.execute("PRAGMA user_version = 7")
-        conn.execute("COMMIT")
-    except Exception:
-        with suppress(sqlite3.OperationalError):
-            conn.execute("ROLLBACK")
-        raise
+        """
+    )
+    for r in conn.execute(
+        "SELECT name, working_on, registered_at_ms, last_seen_ms, "
+        "session_token, status, status_detail, session_id FROM agents_v6_backup"
+    ).fetchall():
+        conn.execute(
+            "INSERT INTO agents (name, working_on, registered_at_ms, "
+            "last_seen_ms, token_hash, status, status_detail, session_id, "
+            "reclaim_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            (
+                r["name"],
+                r["working_on"],
+                r["registered_at_ms"],
+                r["last_seen_ms"],
+                token_hash(r["session_token"]),
+                r["status"],
+                r["status_detail"],
+                r["session_id"],
+            ),
+        )
+    conn.execute("DROP TABLE agents_v6_backup")
+
+
+def _migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
+    """Additive v7 → v8: add nullable `messages.authenticated` (1 when the send
+    was backed by a valid session_token; used to gate read-receipt generation)
+    and an index on `expires_at_ms` so the lazy TTL purge is a range-delete, not
+    a full scan. Idempotent (guarded)."""
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
+    if "authenticated" not in existing:
+        conn.execute("ALTER TABLE messages ADD COLUMN authenticated INTEGER")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at_ms)")
 
 
 def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
@@ -613,12 +655,14 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
 
     The correct migration is a table rebuild: rename → create clean → copy
     with conversion → drop backup. SQLite's ALTER TABLE cannot relax a
-    NOT NULL constraint, so this is the only path. Wrapped in an explicit
-    IMMEDIATE transaction so a crash mid-migration leaves the DB in a
-    consistent state (either fully v1 or fully v2, never a broken hybrid).
+    NOT NULL constraint, so this is the only path. Runs inside the caller's
+    transaction (init_schema owns the single BEGIN IMMEDIATE and stamps
+    user_version atomically); this function manages no transaction of its own.
 
-    Idempotent: if a prior partial migration left backup tables around,
-    they are dropped up front before the rename.
+    Idempotent: leftover backup tables from an interrupted run are dropped up
+    front. Robust to a corrupted v1 table that lacks the name PRIMARY KEY:
+    duplicate names are de-duplicated via ON CONFLICT rather than aborting the
+    whole migration (which would strand the store).
     """
     # Belt-and-suspenders: clear any leftover backup tables from a
     # previously-interrupted migration attempt. DROP IF EXISTS is a no-op
@@ -626,77 +670,61 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE IF EXISTS agents_v1_backup")
     conn.execute("DROP TABLE IF EXISTS messages_v1_backup")
 
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        # 1. Move the v1 tables out of the way
-        conn.execute("ALTER TABLE agents RENAME TO agents_v1_backup")
-        conn.execute("ALTER TABLE messages RENAME TO messages_v1_backup")
+    # 1. Move the v1 tables out of the way
+    conn.execute("ALTER TABLE agents RENAME TO agents_v1_backup")
+    conn.execute("ALTER TABLE messages RENAME TO messages_v1_backup")
 
-        # 2. Create the fresh v2 tables (identical shape to _create_v2_schema)
-        _create_v2_schema(conn)
+    # 2. Create the fresh v2 tables (identical shape to _create_v2_schema)
+    _create_v2_schema(conn)
 
-        # 3. Copy agents with timestamp conversion. If an ISO parse fails,
-        #    default to _now_ms() (better than losing the row; the agent
-        #    can re-register to fix its timestamps).
-        for r in conn.execute(
-            "SELECT name, working_on, registered_at, last_seen, session_token FROM agents_v1_backup"
-        ).fetchall():
-            reg_ms = _iso_to_ms(r["registered_at"]) or _now_ms()
-            seen_ms = _iso_to_ms(r["last_seen"]) or reg_ms
-            conn.execute(
-                "INSERT INTO agents (name, working_on, registered_at_ms, "
-                "last_seen_ms, session_token) VALUES (?, ?, ?, ?, ?)",
-                (r["name"], r["working_on"], reg_ms, seen_ms, r["session_token"]),
-            )
+    # 3. Copy agents with timestamp conversion. If an ISO parse fails, default
+    #    to _now_ms() (better than losing the row). ON CONFLICT keeps the most
+    #    recently-seen row so a duplicate name in a corrupted v1 table can't
+    #    abort the migration.
+    for r in conn.execute(
+        "SELECT name, working_on, registered_at, last_seen, session_token FROM agents_v1_backup"
+    ).fetchall():
+        reg_ms = _iso_to_ms(r["registered_at"]) or _now_ms()
+        seen_ms = _iso_to_ms(r["last_seen"]) or reg_ms
+        conn.execute(
+            "INSERT INTO agents (name, working_on, registered_at_ms, "
+            "last_seen_ms, session_token) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET "
+            "working_on = excluded.working_on, "
+            "session_token = excluded.session_token, "
+            "registered_at_ms = MIN(agents.registered_at_ms, excluded.registered_at_ms), "
+            "last_seen_ms = MAX(agents.last_seen_ms, excluded.last_seen_ms)",
+            (r["name"], r["working_on"], reg_ms, seen_ms, r["session_token"]),
+        )
 
-        # 4. Copy messages. Unparseable expires_at → 0 so the next lazy
-        #    purge cleans up the orphan; unparseable sent_at → _now_ms()
-        #    (better to have the message with an approximate timestamp
-        #    than to lose it).
-        for r in conn.execute(
-            "SELECT id, recipient_name, sender_name, subject, body, "
-            "sent_at, read_at, expires_at FROM messages_v1_backup ORDER BY id ASC"
-        ).fetchall():
-            sent_ms = _iso_to_ms(r["sent_at"]) or _now_ms()
-            read_ms = _iso_to_ms(r["read_at"]) if r["read_at"] else None
-            exp_ms = _iso_to_ms(r["expires_at"]) or 0
-            conn.execute(
-                "INSERT INTO messages (id, recipient_name, sender_name, subject, "
-                "body, sent_at_ms, read_at_ms, expires_at_ms) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    r["id"],
-                    r["recipient_name"],
-                    r["sender_name"],
-                    r["subject"],
-                    r["body"],
-                    sent_ms,
-                    read_ms,
-                    exp_ms,
-                ),
-            )
+    # 4. Copy messages. Unparseable expires_at → 0 so the next lazy purge cleans
+    #    up the orphan; unparseable sent_at → _now_ms().
+    for r in conn.execute(
+        "SELECT id, recipient_name, sender_name, subject, body, "
+        "sent_at, read_at, expires_at FROM messages_v1_backup ORDER BY id ASC"
+    ).fetchall():
+        sent_ms = _iso_to_ms(r["sent_at"]) or _now_ms()
+        read_ms = _iso_to_ms(r["read_at"]) if r["read_at"] else None
+        exp_ms = _iso_to_ms(r["expires_at"]) or 0
+        conn.execute(
+            "INSERT INTO messages (id, recipient_name, sender_name, subject, "
+            "body, sent_at_ms, read_at_ms, expires_at_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                r["id"],
+                r["recipient_name"],
+                r["sender_name"],
+                r["subject"],
+                r["body"],
+                sent_ms,
+                read_ms,
+                exp_ms,
+            ),
+        )
 
-        # 5. Drop the backup tables and any legacy index
-        conn.execute("DROP TABLE agents_v1_backup")
-        conn.execute("DROP TABLE messages_v1_backup")
-
-        # 6. Stamp user_version = 2 INSIDE this transaction so the rebuild and
-        #    the version bump commit atomically. Without this, a crash after
-        #    COMMIT but before init_schema's outer `PRAGMA user_version =
-        #    SCHEMA_VERSION` would leave user_version=0 with v2-shaped tables;
-        #    the next init_schema would re-enter the v1 path, rename the v2
-        #    `agents` to backup, then `SELECT registered_at` (a v1-only column)
-        #    → "no such column" → every tool call raises. Committing the bump
-        #    with the rebuild makes the post-crash version either 1 (rolled
-        #    back) or 2 (done) — never the brick state. The additive 2→3→4→5
-        #    steps are independently idempotent.
-        conn.execute("PRAGMA user_version = 2")
-
-        conn.execute("COMMIT")
-    except Exception:
-        with suppress(sqlite3.OperationalError):
-            conn.execute("ROLLBACK")
-        raise
+    # 5. Drop the backup tables
+    conn.execute("DROP TABLE agents_v1_backup")
+    conn.execute("DROP TABLE messages_v1_backup")
 
 
 # ── Time helpers ─────────────────────────────────────────────────────────────
@@ -1047,6 +1075,7 @@ def agent_meta(name: str) -> dict | None:
         "name": row["name"],
         "working_on": row["working_on"],
         "last_seen": _ms_to_dt(int(row["last_seen_ms"])).isoformat(),  # type: ignore[union-attr]
+        "last_seen_ms": int(row["last_seen_ms"]),
         "session_id": row["session_id"],
         "token_hash": row["token_hash"],
         "reclaim_hash": row["reclaim_hash"],
@@ -1231,6 +1260,8 @@ def send(
     _check_field(subject, "subject")
     _check_field(headline, "headline")
     _check_field(msg_type, "msg_type")
+    if in_reply_to is not None:
+        _check_message_id(in_reply_to, "in_reply_to")
 
     sent_ms = _now_ms()
     expires_ms = sent_ms + ttl_days() * 24 * 60 * 60 * 1000
@@ -1245,6 +1276,7 @@ def send(
         conn.execute("BEGIN IMMEDIATE")
         try:
             sender = from_ if from_ is not None else "anonymous"
+            authenticated = 0  # 1 only when a valid session_token backed the send
             if session_token is not None:
                 row = conn.execute(
                     "SELECT name FROM agents WHERE token_hash = ?",
@@ -1262,12 +1294,24 @@ def send(
                         f"or pass from_={authenticated_name!r}."
                     )
                 sender = authenticated_name
+                authenticated = 1
 
             cur = conn.execute(
                 "INSERT INTO messages (recipient_name, sender_name, subject, body, "
-                "sent_at_ms, read_at_ms, expires_at_ms, msg_type, in_reply_to, headline) "
-                "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
-                (to, sender, subject, body, sent_ms, expires_ms, msg_type, in_reply_to, headline),
+                "sent_at_ms, read_at_ms, expires_at_ms, msg_type, in_reply_to, headline, "
+                "authenticated) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)",
+                (
+                    to,
+                    sender,
+                    subject,
+                    body,
+                    sent_ms,
+                    expires_ms,
+                    msg_type,
+                    in_reply_to,
+                    headline,
+                    authenticated,
+                ),
             )
             msg_id = cur.lastrowid
             # Ring-buffer the recipient's inbox (drop oldest beyond the cap).
@@ -1321,6 +1365,7 @@ def update_status(
     sender if desired.
     """
     init_schema()
+    _check_message_id(message_id)
     if not status or not isinstance(status, str):
         raise DLBError("status must be a non-empty string")
     _check_field(status, "status")
@@ -1386,10 +1431,11 @@ def get_task_status(message_id: int) -> dict | None:
     read.
     """
     init_schema()
+    _check_message_id(message_id)
     with _connect() as conn:
         row = conn.execute(
             "SELECT id, msg_type, in_reply_to, status, status_note, "
-            "status_updated_at_ms, read_at_ms, recipient_name, sender_name "
+            "status_updated_at_ms, read_at_ms "
             "FROM messages WHERE id = ?",
             (message_id,),
         ).fetchone()
@@ -1397,10 +1443,12 @@ def get_task_status(message_id: int) -> dict | None:
         return None
     read_at = _ms_to_dt(row["read_at_ms"])
     status_updated_at = _ms_to_dt(row["status_updated_at_ms"])
+    # A lightweight, auth-free status probe. It deliberately does NOT return
+    # recipient_name/sender_name (the docstring never promised them): keeping the
+    # auth-free surface to pure lifecycle status shrinks the enumeration-harvest
+    # surface (ids are sequential). Use read() for message content/parties.
     return {
         "id": row["id"],
-        "recipient_name": row["recipient_name"],
-        "sender_name": row["sender_name"],
         "msg_type": row["msg_type"],
         "in_reply_to": row["in_reply_to"],
         "status": row["status"],
@@ -1487,10 +1535,15 @@ def read(
 
             # #4 read-receipts: for each TASK message we just marked read, drop a
             # lightweight receipt back to its sender so they learn it was seen
-            # without polling. Storm/loop guards: task-type only; a real
-            # registered recipient is reading (not a dead-letter peek); skip
-            # anonymous senders and self-sends; and receipts are msg_type=
-            # 'receipt' (never 'task') so they never generate further receipts.
+            # without polling. Guards: task-type only; a real registered recipient
+            # is reading (not a dead-letter peek); skip anonymous/self-sends; the
+            # ORIGINAL send must have been AUTHENTICATED (session-token-backed) —
+            # otherwise `sender_name` is a spoofable free-text `from_` and we'd
+            # author false-attribution receipts into an uninvolved agent's inbox;
+            # and receipts are msg_type='receipt' (never 'task') so they never
+            # generate further receipts. The receipt INSERTs also obey the inbox
+            # ring buffer (enforced per recipient below) — the send() path is not
+            # the only writer, so the cap must be applied here too.
             if (
                 ids
                 and mark_read_ms is not None
@@ -1500,8 +1553,13 @@ def read(
                 read_iso = _ms_to_dt(mark_read_ms).isoformat()  # type: ignore[union-attr]
                 exp_ms = mark_read_ms + ttl_days() * 24 * 60 * 60 * 1000
                 id_set = set(ids)
+                receipt_recipients: set[str] = set()
                 for r in rows:
-                    if r["id"] not in id_set or (r["msg_type"] or "") != "task":
+                    if (
+                        r["id"] not in id_set
+                        or (r["msg_type"] or "") != "task"
+                        or not r["authenticated"]
+                    ):
                         continue
                     origin = r["sender_name"]
                     if origin in (None, "anonymous", name):
@@ -1530,6 +1588,10 @@ def read(
                             f"✓ read by {name}: {label}",
                         ),
                     )
+                    receipt_recipients.add(origin)
+                # Keep the ring-buffer invariant on every inbox we just wrote to.
+                for origin in receipt_recipients:
+                    _enforce_inbox_cap(conn, origin)
 
             conn.execute("COMMIT")
         except Exception:
@@ -1557,6 +1619,7 @@ def ack(message_id: int, session_token: str) -> bool:
     no owner to take responsibility.)
     """
     init_schema()
+    _check_message_id(message_id)
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:

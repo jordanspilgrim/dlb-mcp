@@ -30,14 +30,27 @@ from . import store
 
 def registered_names() -> list[str]:
     """Names with a token sidecar under <store_dir>/tokens/. Sorted; [] on any
-    error or missing dir (the hook must never break a session start)."""
+    error or missing dir (the hook must never break a session start).
+
+    Sidecar FILENAMES are sha256(name) hashes (collision-free), so the human
+    name is read from line 1 of each file's contents rather than the filename."""
     d = store.tokens_dir()
     if not d.is_dir():
         return []
+    names: list[str] = []
     try:
-        return sorted(p.name for p in d.iterdir() if p.is_file())
+        for p in d.iterdir():
+            if not p.is_file():
+                continue
+            try:
+                first = p.read_text().splitlines()[0]
+            except (OSError, IndexError):
+                continue
+            if first:
+                names.append(first)
     except OSError:
         return []
+    return sorted(names)
 
 
 def main() -> None:

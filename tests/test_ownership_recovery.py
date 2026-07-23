@@ -232,19 +232,36 @@ def test_e2e_owner_recovers_but_foreign_session_is_refused(tmp_path: Path) -> No
 # ── Design 1: harness-session-id recovery (survives an MCP-server respawn) ────
 
 
-def test_new_process_same_session_id_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_new_process_same_session_id_recovers_when_holder_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Crash-respawn: same DLB_SESSION_ID, and the prior holder is STALE (its dead
+    # process stopped heartbeating). With the #4 stale-gate, recovery requires
+    # staleness — use window=0 so the just-registered holder counts as stale.
+    monkeypatch.setenv("DLB_TAKEOVER_AFTER_SECONDS", "0")
     monkeypatch.setenv("DLB_SESSION_ID", "S1")
     reg = server.register("alpha")
-    server._reset_owned_names_for_tests()  # new process: empty owned-set...
-    # ...but same harness session (DLB_SESSION_ID still S1) → recover via match.
-    # With hashed-at-rest tokens this MINTS a fresh token (the DB has only a hash
-    # and this new process never held the original).
+    server._reset_owned_names_for_tests()  # new process: empty owned-set
     rec = server.recover_token("alpha")
     assert rec is not None
     assert rec["session_token"] and rec["session_token"] != reg["session_token"]  # rotated
     assert server._owns("alpha"), "ownership should be adopted on session-id match"
-    # The recovered token actually works.
     assert store.read("alpha", session_token=rec["session_token"]) == []
+
+
+def test_live_holder_not_evictable_via_shared_session_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Red-team #4: a LIVE (non-stale) holder must NOT be recoverable/evictable by
+    # a different process that merely shares DLB_SESSION_ID (the static-config
+    # footgun). Default window (24h) → the just-registered holder is live.
+    monkeypatch.setenv("DLB_SESSION_ID", "S1")
+    reg = server.register("victim")
+    server._reset_owned_names_for_tests()  # a distinct live process, same id
+    with pytest.raises(AuthError):
+        server.recover_token("victim")
+    # The victim's token is untouched (not rotated/evicted).
+    assert store.read("victim", session_token=reg["session_token"]) == []
 
 
 def test_new_process_different_session_id_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -281,12 +298,16 @@ def test_bound_session_id_is_persisted(monkeypatch: pytest.MonkeyPatch) -> None:
     assert store.bound_session_id("alpha") == "S1"
 
 
-def test_e2e_crash_respawn_same_session_recovers(tmp_path: Path) -> None:
+def test_e2e_crash_respawn_same_session_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Design 1 over the wire: process A registers `alpha` under session S1 and
     EXITS (simulating an MCP-server crash). A brand-new process with the SAME
-    DLB_SESSION_ID recovers the token with no stale-gate — proving recovery
+    DLB_SESSION_ID recovers once the (dead) holder is stale — proving recovery
     rests on the persisted session id, not the (now-empty) in-memory owned-set.
-    A process with a DIFFERENT id is refused."""
+    A process with a DIFFERENT id is refused. (Window=0 so the dead holder is
+    immediately stale; the #4 stale-gate blocks eviction of a *live* holder.)"""
+    monkeypatch.setenv("DLB_TAKEOVER_AFTER_SECONDS", "0")
     shared = tmp_path / "shared.sqlite3"
 
     with _session(shared, session_id="S1") as a:

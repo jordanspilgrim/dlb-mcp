@@ -200,9 +200,11 @@ def test_get_task_status_returns_current_state_without_auth() -> None:
     assert initial is not None
     assert initial["status"] is None  # not yet updated
     assert initial["msg_type"] == "task"
-    assert initial["recipient_name"] == "alpha"
-    assert initial["sender_name"] == "qa"
     assert initial["read_at"] is None
+    # It is a pure lifecycle-status probe: parties are NOT exposed (shrinks the
+    # auth-free enumeration-harvest surface). Use read() for content/parties.
+    assert "recipient_name" not in initial
+    assert "sender_name" not in initial
 
     # Recipient accepts
     store.update_status(

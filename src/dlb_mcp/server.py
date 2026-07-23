@@ -9,6 +9,7 @@ here exist only to:
 
 from __future__ import annotations
 
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -240,11 +241,19 @@ def recover_token(name: str) -> dict[str, Any] | None:
     meta = store.agent_meta(name)
     if meta is None:
         return None  # never registered anywhere
-    # Design 1: same harness session (stable id across an MCP-server respawn).
-    # Both sides must be non-None and equal — an unset/None id never matches, so
-    # two sessions that both lack DLB_SESSION_ID can't recover each other.
+    # Design 1: same harness session (stable id across an MCP-server respawn),
+    # AND the prior holder is STALE. Both id sides must be non-None and equal —
+    # an unset/None id never matches. The staleness gate is the security fix for
+    # red-team #4: without it, a misconfigured (static) DLB_SESSION_ID shared
+    # across sessions would let any peer silently mint a token for — and EVICT —
+    # a LIVE holder. Design 1's real premise is a crash-respawn, where the prior
+    # process is dead and thus stale; a live holder (recent last_seen) is never
+    # evictable this way. A fast crash-respawn that isn't stale yet still recovers
+    # instantly via the sidecar reclaim secret (register(force=True, prior_token)).
     sid = store.current_session_id()
-    if sid is not None and meta["session_id"] == sid:
+    holder_age_s = (int(time.time() * 1000) - int(meta["last_seen_ms"])) / 1000
+    same_session = sid is not None and meta["session_id"] == sid
+    if same_session and holder_age_s >= store.takeover_after_seconds():
         new_token = store.mint_token()
         # Rotate the reclaim secret too, so the sidecar credential stays fresh.
         store.rotate_token(name, new_token, store.mint_token())  # old token dies
@@ -256,13 +265,14 @@ def recover_token(name: str) -> dict[str, Any] | None:
             "working_on": refreshed.get("working_on"),
             "last_seen": refreshed.get("last_seen"),
         }
-    # Registered, but not ours by either check → refuse.
+    # Registered, but not recoverable by this session → refuse.
     raise store.AuthError(
-        f"recover_token refused: this session did not register {name!r}. "
-        "recover_token only returns a token to the session that registered the "
-        "name (same process, or same DLB_SESSION_ID). If you are resuming after "
-        "a full restart, reclaim it with register(force=True) once the prior "
-        "holder goes stale; if this is a different agent, pick your own name."
+        f"recover_token refused: this session did not register {name!r} (or the "
+        "live holder is not stale). recover_token returns a token only to the "
+        "same process, or the same DLB_SESSION_ID once the prior holder is stale. "
+        "To reclaim after a full restart, read your reclaim secret from the "
+        "sidecar and call register(force=True, prior_token=<secret>) — instant, "
+        "no wait; if this is a different agent, pick your own name."
     )
 
 
@@ -324,6 +334,9 @@ def list_threads(
             (append …). Pass 0 to omit `working_on` entirely for the leanest
             roster; a large value to get full text. Default 140.
     """
+    # Clamp to a sane range so a pathological JSON int can't overflow timedelta
+    # (which raised a raw OverflowError). 10^7 hours ≈ 1141 years.
+    active_within_hours = max(0, min(int(active_within_hours), 10_000_000))
     items = store.list_threads(active_within=timedelta(hours=active_within_hours))
     if not include_stale:
         items = [s for s in items if not s.stale]

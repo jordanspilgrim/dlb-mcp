@@ -64,7 +64,7 @@ LOOP_ERROR_BACKOFF_SECONDS = 5.0
 # events or corrupt the line. store.py now rejects these at write time, but the
 # monitor reads raw SQLite (and may see legacy pre-fix rows), so it sanitizes
 # again at the sink. Defense in depth: never trust the stored value here.
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_CONTROL_CHARS_RE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
 
 def _sanitize_line(s: str) -> str:

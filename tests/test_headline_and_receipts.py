@@ -85,3 +85,47 @@ def test_env_opt_out_disables_receipts(monkeypatch: pytest.MonkeyPatch):
     store.send(to="worker", body="do X", from_="boss", session_token=boss_t, msg_type="task")
     store.read("worker", session_token=worker_t)
     assert store.read("boss", session_token=boss_t) == []
+
+
+# ── Stage 2 red-team regressions (#1 cap, #9 auth-gate) ──────────────────────
+
+
+def test_receipts_respect_inbox_ring_buffer(monkeypatch: pytest.MonkeyPatch):
+    # Red-team #1/B1: a dispatcher that only ever RECEIVES receipts must stay
+    # bounded by DLB_MAX_INBOX. Before the fix the receipt path bypassed the cap
+    # and the dispatcher's inbox grew linearly without bound.
+    monkeypatch.setenv("DLB_MAX_INBOX", "5")
+    boss_t = store.register("boss")["session_token"]
+    worker_t = store.register("worker")["session_token"]
+    for cycle in range(6):
+        for i in range(10):
+            store.send(
+                to="worker",
+                body=f"t{cycle}-{i}",
+                from_="boss",
+                session_token=boss_t,
+                msg_type="task",
+            )
+        store.read("worker", session_token=worker_t)  # emits receipts to boss
+    boss_inbox = store.read("boss", session_token=boss_t, unread_only=False, limit=1000)
+    assert len(boss_inbox) <= 5, f"receipt inbox exceeded the cap: {len(boss_inbox)}"
+
+
+def test_unauthenticated_task_generates_no_receipt(monkeypatch: pytest.MonkeyPatch):
+    # Red-team #9/B2: a spoofed unauthenticated send (from_='victim', no token)
+    # must NOT cause DLB to author a false-attribution receipt into victim's inbox.
+    victim_t = store.register("victim")["session_token"]
+    reader_t = store.register("reader")["session_token"]
+    store.send(to="reader", body="do X", from_="victim", msg_type="task")  # no session_token
+    store.read("reader", session_token=reader_t)
+    assert store.read("victim", session_token=victim_t) == []
+
+
+def test_authenticated_task_still_receipts(monkeypatch: pytest.MonkeyPatch):
+    # The auth-gate must not break the legitimate (token-backed) receipt flow.
+    boss_t = store.register("boss")["session_token"]
+    worker_t = store.register("worker")["session_token"]
+    store.send(to="worker", body="do X", from_="boss", session_token=boss_t, msg_type="task")
+    store.read("worker", session_token=worker_t)
+    receipts = store.read("boss", session_token=boss_t)
+    assert len(receipts) == 1 and receipts[0].msg_type == "receipt"
