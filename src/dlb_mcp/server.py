@@ -124,22 +124,26 @@ def _message_dict(m: store.Message) -> dict[str, Any]:
 # the SQLite file) can still obtain the token — but that is raw-store access,
 # already out of scope under DLB's trust boundary (same as reading the DB file).
 # The point is that mcp__dlb__recover_token stops being a token dispenser.
-_owned_names: set[str] = set()
+# name → live token, for names THIS process registered. Since the DB stores only
+# sha256(token), this in-memory map is the ONLY place a full token lives besides
+# the client that called register — and it is what recover_token returns to the
+# same session after compaction (the process, and this map, outlive compaction).
+_owned_tokens: dict[str, str] = {}
 
 
-def _mark_owned(name: str) -> None:
-    _owned_names.add(name)
+def _mark_owned(name: str, token: str) -> None:
+    _owned_tokens[name] = token
 
 
 def _owns(name: str) -> bool:
-    return name in _owned_names
+    return name in _owned_tokens
 
 
 def _reset_owned_names_for_tests() -> None:
-    """Test hook: clear the process-global owned set. Real sessions never call
-    this (the set dies with the process); tests share one process, so they must
+    """Test hook: clear the process-global owned-token map. Real sessions never
+    call this (it dies with the process); tests share one process, so they must
     reset between cases to simulate distinct sessions."""
-    _owned_names.clear()
+    _owned_tokens.clear()
 
 
 # ── Tools ────────────────────────────────────────────────────────────────────
@@ -180,11 +184,11 @@ def register(
             Lets a legitimate handoff bypass the stale-gate on force=True.
     """
     result = store.register(name, working_on=working_on, force=force, prior_token=prior_token)
-    # This session now owns the name — recover_token will return its token to us
-    # (and only us) for the rest of this process's life, including after
-    # compaction. force-reclaim of a stale name also lands here, so a legitimate
-    # takeover gains ownership too.
-    _mark_owned(name)
+    # Cache the live token in process memory — the DB holds only its hash, so
+    # this map is how recover_token hands the token back to THIS session after
+    # compaction. force-reclaim also lands here, so a legitimate takeover caches
+    # its fresh token too.
+    _mark_owned(name, result["session_token"])
     return result
 
 
@@ -214,25 +218,45 @@ def recover_token(name: str) -> dict[str, Any] | None:
     where any caller could recover any name's token. The gate covers the tool
     API; raw store/SQLite access is out of scope, per DLB's trust boundary.
 
+    With hashed-at-rest tokens the Design 1 path MINTS a fresh token (the DB has
+    only a hash and a crash-respawned process never held the original) — safe, it
+    proved same-session and the old process is dead.
+
     Returns None if `name` was never registered anywhere. Raises if `name` is
     registered but by a different session.
 
     Args:
         name: The name you previously registered and want the token for.
     """
+    # Design 2: same process — the live token is in our memory cache.
     if _owns(name):
-        return store.recover_token(name)
+        meta = store.agent_meta(name) or {}
+        return {
+            "name": name,
+            "session_token": _owned_tokens[name],
+            "working_on": meta.get("working_on"),
+            "last_seen": meta.get("last_seen"),
+        }
+    meta = store.agent_meta(name)
+    if meta is None:
+        return None  # never registered anywhere
     # Design 1: same harness session (stable id across an MCP-server respawn).
     # Both sides must be non-None and equal — an unset/None id never matches, so
     # two sessions that both lack DLB_SESSION_ID can't recover each other.
     sid = store.current_session_id()
-    if sid is not None and store.bound_session_id(name) == sid:
-        _mark_owned(name)  # adopt: this genuinely is the same session
-        return store.recover_token(name)
-    # Not ours. Distinguish "never existed" (None, as before) from "exists but
-    # is someone else's" (a clear, actionable refusal).
-    if store.recover_token(name) is None:
-        return None
+    if sid is not None and meta["session_id"] == sid:
+        new_token = store.mint_token()
+        # Rotate the reclaim secret too, so the sidecar credential stays fresh.
+        store.rotate_token(name, new_token, store.mint_token())  # old token dies
+        _mark_owned(name, new_token)  # adopt + cache
+        refreshed = store.agent_meta(name) or {}
+        return {
+            "name": name,
+            "session_token": new_token,
+            "working_on": refreshed.get("working_on"),
+            "last_seen": refreshed.get("last_seen"),
+        }
+    # Registered, but not ours by either check → refuse.
     raise store.AuthError(
         f"recover_token refused: this session did not register {name!r}. "
         "recover_token only returns a token to the session that registered the "
@@ -339,12 +363,13 @@ def send(
     - With session_token: token is looked up. If from_ is omitted, it
       becomes the token's registered name. If from_ is supplied, it MUST
       match the token's name or AuthError is raised.
-    - This is NOT unforgeable provenance. Tokens are deterministic and
-      recover_token(name) hands any name's token to any caller, so any
-      same-user agent can obtain X's token and send a message stored as
-      sender_name=X with the check passing. Treat sender_name as an
-      attribution HINT, not proof of origin — fine under DLB's cooperative
-      same-user model, but never a trust boundary between distinct agents.
+    - This is NOT unforgeable provenance. No token is stored at rest, so the tool
+      API won't hand a peer X's token and a raw file read won't reveal one — the
+      most a same-user peer with raw access can do is read the sidecar's
+      single-use reclaim secret and hijack X once (which rotates it → detectable).
+      Treat sender_name as an attribution HINT, not proof of origin — fine under
+      DLB's cooperative same-user model, but never a trust boundary between
+      distinct agents.
 
     Size caps (raise DLBError on overflow): body <= DLB_MAX_BODY_BYTES
     (default 256 KiB); to/from_/subject/headline/msg_type each <=
@@ -464,7 +489,7 @@ def unregister(name: str, session_token: str) -> dict[str, Any]:
     """
     ok = store.unregister(name, session_token)
     if ok:
-        _owned_names.discard(name)  # released → this session no longer owns it
+        _owned_tokens.pop(name, None)  # released → this session no longer owns it
     return {"ok": ok, "name": name}
 
 

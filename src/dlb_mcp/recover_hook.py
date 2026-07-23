@@ -48,9 +48,9 @@ def main() -> None:
     out.write(
         "📇 DLB: names registered on this machine. If one is YOURS:\n"
         "  • lost your token mid-session (compaction) → mcp__dlb__recover_token(name)\n"
-        "  • after a full restart (recover_token refused) → the token is persisted;\n"
-        f"    read line 2 of {store.tokens_dir()}/<name> and call\n"
-        "    register(name, force=true, prior_token=<that token>) to reclaim instantly.\n"
+        "  • after a full restart (recover_token refused) → a single-use reclaim\n"
+        f"    secret is persisted; read line 2 of {store.tokens_dir()}/<name> and call\n"
+        "    register(name, force=true, prior_token=<that secret>) to reclaim instantly.\n"
     )
     for n in names:
         out.write(f"  - {n}\n")

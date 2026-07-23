@@ -237,9 +237,14 @@ def test_new_process_same_session_id_recovers(monkeypatch: pytest.MonkeyPatch) -
     reg = server.register("alpha")
     server._reset_owned_names_for_tests()  # new process: empty owned-set...
     # ...but same harness session (DLB_SESSION_ID still S1) → recover via match.
+    # With hashed-at-rest tokens this MINTS a fresh token (the DB has only a hash
+    # and this new process never held the original).
     rec = server.recover_token("alpha")
-    assert rec is not None and rec["session_token"] == reg["session_token"]
+    assert rec is not None
+    assert rec["session_token"] and rec["session_token"] != reg["session_token"]  # rotated
     assert server._owns("alpha"), "ownership should be adopted on session-id match"
+    # The recovered token actually works.
+    assert store.read("alpha", session_token=rec["session_token"]) == []
 
 
 def test_new_process_different_session_id_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -292,10 +297,19 @@ def test_e2e_crash_respawn_same_session_recovers(tmp_path: Path) -> None:
 
     with _session(shared, session_id="S1") as respawn:
         rec = _call(respawn, 2, "recover_token", {"name": "alpha"})
-        assert rec.get("session_token") == token, "same-session respawn must recover"
+        new_token = rec.get("session_token")
+        # Recovery mints a fresh token (hashed-at-rest); it must be present, work,
+        # and differ from the original (which the dead process held).
+        assert new_token and new_token != token, "same-session respawn must recover a fresh token"
+        got = _call(respawn, 3, "read", {"name": "alpha", "session_token": new_token})
+        # read of an empty inbox → [] (wrapped as {"_value": []} by the helper);
+        # the point is it AUTHENTICATED (no error), proving the fresh token works.
+        assert not (isinstance(got, dict) and ("_error" in got or got.get("_isError"))), (
+            f"recovered token should authenticate reads: {got}"
+        )
 
     with _session(shared, session_id="S2") as foreign:
-        rej = _call(foreign, 3, "recover_token", {"name": "alpha"})
+        rej = _call(foreign, 4, "recover_token", {"name": "alpha"})
         assert "_error" in rej or rej.get("_isError"), "different session must be refused"
 
 
@@ -323,15 +337,30 @@ def test_persisted_token_reclaim_after_full_restart(monkeypatch: pytest.MonkeyPa
     with pytest.raises(store.TakeoverDenied):
         server.register("alpha", force=True)
 
-    # Persisted-token reclaim: read the token from the sidecar (line 2) and
-    # present it. It matches → instant reclaim, no stale-gate wait.
-    persisted = store.sidecar_path("alpha").read_text().splitlines()[1]
-    assert persisted == token
-    reclaimed = server.register("alpha", force=True, prior_token=persisted)
-    assert reclaimed["session_token"] == token
+    # Reclaim: read the single-use RECLAIM SECRET from the sidecar (line 2) — NOT
+    # the token — and present it. It matches reclaim_hash → instant reclaim, no
+    # stale-gate wait, and the token+secret both ROTATE.
+    secret = store.sidecar_path("alpha").read_text().splitlines()[1]
+    assert secret != token  # the sidecar never held the token
+    reclaimed = server.register("alpha", force=True, prior_token=secret)
+    assert reclaimed["session_token"] != token  # rotated
     # Ownership regained → recover_token works again in this new session.
     assert server._owns("alpha")
     assert server.recover_token("alpha") is not None
+    # Single-use + tamper-evident: the OLD secret no longer reclaims (a thief who
+    # copied it before the legit owner reclaimed would now be locked out/detected).
+    server._reset_owned_names_for_tests()
+    with pytest.raises(store.TakeoverDenied):
+        server.register("alpha", force=True, prior_token=secret)
+
+
+def test_reclaim_secret_is_not_a_usable_session_token() -> None:
+    server.register("alpha")
+    secret = store.sidecar_path("alpha").read_text().splitlines()[1]
+    # The reclaim secret authenticates ONLY as prior_token for a reclaim; it is
+    # NOT a session token and must not authenticate reads/sends/etc.
+    with pytest.raises(AuthError):
+        store.read("alpha", session_token=secret)
 
 
 def test_recover_hook_documents_both_recovery_paths(capsys: pytest.CaptureFixture[str]) -> None:
