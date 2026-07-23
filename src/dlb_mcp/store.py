@@ -22,14 +22,13 @@ SQLite file. Any process running as the same OS user can read ~/.dlb/store.sqlit
 directly. DLB is COORDINATION between cooperating agents, not confidentiality
 against adversarial ones.
 
-Scope of the token, precisely: because tokens are deterministic and
-`recover_token(name)` returns any name's token to any caller (see below), the
-session_token is NOT a security boundary BETWEEN distinct same-user agents — any
-agent can obtain any other agent's token through the tool API alone and then
-read its inbox, unregister it, or send messages authenticated as it. The token's
-real job is (a) letting an agent re-find its own identity after compaction and
-(b) making the "who am I" handshake explicit. Treat `sender_name` on a received
-message as an attribution HINT, not a cryptographically authenticated fact.
+Scope of the token, precisely: the MCP tool API never hands one session another
+session's token (recover_token is gated by per-process ownership / session-id).
+Tokens are random (not derivable) and rotate on takeover. What remains out of
+scope is RAW access — a same-user peer that reads the SQLite file or a sidecar,
+or imports the store module directly, can still obtain a token, exactly as it
+could read any of the user's files. So treat `sender_name` on a received message
+as an attribution HINT, not a cryptographically authenticated fact.
 """
 
 from __future__ import annotations
@@ -180,72 +179,27 @@ def read_receipts_enabled() -> bool:
     }
 
 
-# ── Deterministic identity (rec #1B) ─────────────────────────────────────────
-# A session_token that is a pure function of (per-user secret, name) cannot be
-# "lost": after a restart or context compaction, re-registering the name — or
-# calling recover_token(name) — yields the SAME token, with no stored value to
-# look up. The secret is 32 random bytes on disk (chmod 600), so tokens stay
-# unguessable WITHOUT it, but any cooperating same-OS-user session (or, later,
-# any account holding the shared secret — the cross-account identity layer)
-# derives the identical token. Trade-off (owner-approved 2026-07-15): because
-# the token is invariant, a force-takeover no longer MINTS a different token or
-# invalidates the old one — acceptable under DLB's cooperative same-OS-user
-# model, where takeover reclaims a dead name rather than evicting a hostile one.
+# ── Token identity (random, hashed at rest) ──────────────────────────────────
+# Tokens are high-entropy random strings, NOT derived from any on-disk secret.
+# The DB stores only sha256(token) (the agents.token_hash column), so reading the
+# SQLite file — or a direct ``import dlb_mcp.store`` — yields only a hash, never a
+# usable token. The live token exists solely in the memory of the process that
+# minted it (the server-side owned-token cache) and in the client that called
+# register. A force-takeover mints a FRESH token, invalidating the prior
+# holder's — restoring real eviction (the earlier deterministic scheme could not
+# rotate, since the token was a pure function of the name).
 
 
-def _secret_path() -> Path:
-    """Secret lives beside the store, so an isolated store dir → isolated secret
-    (keeps tests hermetic and lets a fleet scope its identity to one store)."""
-    return store_path().parent / "secret"
+def mint_token() -> str:
+    """A fresh, unguessable session token (256 bits of CSPRNG entropy)."""
+    return secrets.token_hex(32)
 
 
-def _get_or_create_secret() -> bytes:
-    """Read (or first-time create) the 32-byte per-store secret.
-
-    Creation is atomic and race-free: the candidate is written via
-    ``O_CREAT | O_EXCL``, so among N sibling agents starting against a fresh
-    store exactly ONE wins the create and every loser re-reads the winner's
-    secret. The prior implementation used a plain ``write_bytes`` (last-writer-
-    wins), which let two racers persist *different* secrets and silently diverge
-    every derived token. Mode 0o600 is set at open time. Not cached — the store
-    path can change between calls in tests.
-    """
-    p = _secret_path()
-    try:
-        data = p.read_bytes()
-        if len(data) >= 32:
-            return data
-    except OSError:
-        pass
-    _ensure_store_dir()
-    secret = secrets.token_bytes(32)
-    try:
-        fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        # Lost the create race (or a pre-existing file). Prefer the persisted
-        # secret so every process converges on one value.
-        with suppress(OSError):
-            data = p.read_bytes()
-            if len(data) >= 32:
-                return data
-        # File exists but is unreadable/short (e.g. a truncated legacy write).
-        # Don't race to overwrite a file another process may be mid-write on;
-        # fall back to an ephemeral secret for this call only.
-        return secret
-    except OSError:
-        return secret  # e.g. read-only home — ephemeral, best-effort
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(secret)
-    except OSError:
-        return secret
-    return secret
-
-
-def deterministic_token(name: str) -> str:
-    """token = HMAC-SHA256(secret, name). Stable across restart; unguessable
-    without the secret; distinct per name."""
-    return hmac.new(_get_or_create_secret(), name.encode("utf-8"), hashlib.sha256).hexdigest()
+def token_hash(token: str) -> str:
+    """sha256 hex of a token — what the DB stores at rest. A random 256-bit token
+    has no low-entropy preimage to brute-force, so a plain fast hash (no salt or
+    KDF) is sufficient; the point is only to keep plaintext off disk."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def tokens_dir() -> Path:
@@ -853,7 +807,7 @@ def register(
                         raise TakeoverDenied(name, age_seconds)
 
             now_ms = _now_ms()
-            token = deterministic_token(name)
+            token = mint_token()
             # Bind this registration to the current harness session (Design 1).
             # None when DLB_SESSION_ID is unset → session-id recovery inactive.
             sid = current_session_id()
@@ -1061,13 +1015,12 @@ def send(
     - With session_token: the token is looked up; if `from_` is omitted, it
       becomes the token's registered name; if `from_` is supplied, it MUST
       equal the token's name or AuthError is raised.
-    - What this does NOT give you: unforgeable provenance. Tokens are
-      deterministic and `recover_token(name)` returns any name's token to any
-      caller, so any same-user agent can obtain X's token and send a message
-      that stores sender_name=X with the token check passing. `sender_name` is
-      therefore an attribution HINT, not proof of origin. This is acceptable
-      under DLB's cooperative same-OS-user model but must not be relied on as a
-      trust boundary between distinct agents.
+    - What this does NOT give you: unforgeable provenance. The tool API won't
+      hand a peer X's token, but a same-user peer with RAW access (read the
+      SQLite file or a sidecar) can obtain it and send a message that stores
+      sender_name=X with the token check passing. `sender_name` is therefore an
+      attribution HINT, not proof of origin. Acceptable under DLB's cooperative
+      same-OS-user model but never a trust boundary between distinct agents.
 
     Size caps (all reject with DLBError on overflow):
     - body bytes (UTF-8) must be <= DLB_MAX_BODY_BYTES (default 256KiB).

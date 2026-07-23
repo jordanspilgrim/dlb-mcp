@@ -132,18 +132,9 @@ def test_read_registered_without_token_is_rejected() -> None:
 
 
 # ── Issue 6: atomic secret creation ──────────────────────────────────────────
-
-
-def test_secret_creation_is_stable_and_persisted(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("DLB_STORE", str(tmp_path / "s" / "store.sqlite3"))
-    s1 = store._get_or_create_secret()
-    s2 = store._get_or_create_secret()
-    assert s1 == s2 and len(s1) >= 32
-    # The secret file exists with tight perms and matches what we return.
-    p = store._secret_path()
-    assert p.read_bytes() == s1
-    mode = p.stat().st_mode & 0o777
-    assert mode == 0o600
+# (Removed: the per-store HMAC secret was retired when tokens became random —
+# there is no derived-token secret to create atomically anymore. See
+# test_token_identity.py for the random-token contract.)
 
 
 # ── Issue 7: migration stamps user_version atomically ────────────────────────

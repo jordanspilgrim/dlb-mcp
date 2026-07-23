@@ -324,11 +324,12 @@ def test_persisted_token_reclaim_after_full_restart(monkeypatch: pytest.MonkeyPa
         server.register("alpha", force=True)
 
     # Persisted-token reclaim: read the token from the sidecar (line 2) and
-    # present it. It matches → instant reclaim, no stale-gate wait.
+    # present it. It matches → instant reclaim, no stale-gate wait. The reclaim
+    # ROTATES the token (random-token eviction), so the returned token is fresh.
     persisted = store.sidecar_path("alpha").read_text().splitlines()[1]
     assert persisted == token
     reclaimed = server.register("alpha", force=True, prior_token=persisted)
-    assert reclaimed["session_token"] == token
+    assert reclaimed["session_token"] != token  # rotated
     # Ownership regained → recover_token works again in this new session.
     assert server._owns("alpha")
     assert server.recover_token("alpha") is not None

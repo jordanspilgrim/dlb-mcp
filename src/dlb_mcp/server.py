@@ -339,12 +339,12 @@ def send(
     - With session_token: token is looked up. If from_ is omitted, it
       becomes the token's registered name. If from_ is supplied, it MUST
       match the token's name or AuthError is raised.
-    - This is NOT unforgeable provenance. Tokens are deterministic and
-      recover_token(name) hands any name's token to any caller, so any
-      same-user agent can obtain X's token and send a message stored as
-      sender_name=X with the check passing. Treat sender_name as an
-      attribution HINT, not proof of origin — fine under DLB's cooperative
-      same-user model, but never a trust boundary between distinct agents.
+    - This is NOT unforgeable provenance. The tool API won't hand a peer X's
+      token, but a same-user peer with RAW access (read the SQLite file or a
+      sidecar) can still obtain it and send a message stored as sender_name=X.
+      Treat sender_name as an attribution HINT, not proof of origin — fine under
+      DLB's cooperative same-user model, but never a trust boundary between
+      distinct agents.
 
     Size caps (raise DLBError on overflow): body <= DLB_MAX_BODY_BYTES
     (default 256 KiB); to/from_/subject/headline/msg_type each <=

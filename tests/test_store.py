@@ -81,11 +81,8 @@ def test_register_with_force_evicts_prior_session() -> None:
     """Legitimate handoff: caller has the prior token, so force=True
     bypasses the stale-gate and refreshes working_on.
 
-    Deterministic tokens (v0.4.0, owner-approved 2026-07-15): token =
-    HMAC(secret, name) is INVARIANT, so a takeover returns the SAME token and
-    the prior token still authenticates. This is the accepted trade for
-    un-loseable identity across restart — under DLB's cooperative same-OS-user
-    model, takeover reclaims a name rather than evicting a hostile holder."""
+    Random tokens: a takeover mints a FRESH token and INVALIDATES the prior
+    one (real eviction), which the earlier deterministic scheme could not do."""
     r1 = store.register("alpha")
     r2 = store.register(
         "alpha",
@@ -93,10 +90,12 @@ def test_register_with_force_evicts_prior_session() -> None:
         force=True,
         prior_token=r1["session_token"],
     )
-    assert r2["session_token"] == r1["session_token"]  # deterministic — invariant
+    assert r2["session_token"] != r1["session_token"]  # rotated
     assert r2["working_on"] == "taking over"
-    # The (identical) token still authenticates — takeover does not invalidate.
-    store.read("alpha", session_token=r1["session_token"])
+    # The new token authenticates; the old one no longer does.
+    store.read("alpha", session_token=r2["session_token"])
+    with pytest.raises(AuthError):
+        store.read("alpha", session_token=r1["session_token"])
 
 
 def test_suggestions_skip_already_taken_alternatives() -> None:
