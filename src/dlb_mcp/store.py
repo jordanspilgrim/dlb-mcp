@@ -345,63 +345,72 @@ def _connect() -> Iterator[sqlite3.Connection]:
 
 
 def init_schema() -> None:
-    """Create tables if missing; migrate through v1→v2→v3 as needed. Idempotent."""
+    """Bring the store to the current schema — atomically and race-safely.
+
+    The entire check-and-migrate runs in ONE `BEGIN IMMEDIATE` transaction with
+    double-checked locking: N concurrent processes serialize on the write lock;
+    a loser re-reads `user_version` under the lock, sees the winner already
+    migrated, and returns without running any DDL. Table creation, all
+    migrations, and the `user_version` stamp commit together, so a crash can
+    never leave a half-migrated or mis-versioned store. Idempotent.
+
+    Forward-compat: a store whose `user_version` is NEWER than this build (an
+    older dlb-mcp meeting a store a newer one upgraded) raises a clear DLBError
+    instead of letting raw `no such column` errors leak from every operation.
+    """
     with _connect() as conn:
-        current_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        current = conn.execute("PRAGMA user_version").fetchone()[0]
+        if current == SCHEMA_VERSION:
+            return
+        if current > SCHEMA_VERSION:
+            raise DLBError(
+                f"DLB store schema v{current} is newer than this dlb-mcp "
+                f"(supports v{SCHEMA_VERSION}). Upgrade dlb-mcp to match."
+            )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Re-read under the lock: another process may have migrated while we
+            # waited for the write lock. This closes the check-then-act window
+            # that let concurrent callers double-run migrations and throw.
+            current = conn.execute("PRAGMA user_version").fetchone()[0]
+            if current >= SCHEMA_VERSION:
+                conn.execute("COMMIT")
+                return
+            _apply_migrations(conn)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.execute("COMMIT")
+        except Exception:
+            with suppress(sqlite3.OperationalError):
+                conn.execute("ROLLBACK")
+            raise
 
-        if current_version >= SCHEMA_VERSION:
-            return  # already at current schema
 
-        if current_version == 0:
-            # Fresh DB OR pre-versioning v1 DB. Probe for legacy v1 tables.
-            row = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='agents'"
-            ).fetchone()
-            if row is None:
-                # Truly fresh — create current schema directly (already v7).
-                _create_current_schema(conn)
-            else:
-                # Legacy v1 DB without a user_version stamp. Migrate all the way up.
-                _migrate_v1_to_v2(conn)
-                _migrate_v2_to_v3(conn)
-                _migrate_v3_to_v4(conn)
-                _migrate_v4_to_v5(conn)
-                _migrate_v5_to_v6(conn)
-                _migrate_v6_to_v7(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif current_version == 1:
-            _migrate_v1_to_v2(conn)
-            _migrate_v2_to_v3(conn)
-            _migrate_v3_to_v4(conn)
-            _migrate_v4_to_v5(conn)
-            _migrate_v5_to_v6(conn)
-            _migrate_v6_to_v7(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif current_version == 2:
-            _migrate_v2_to_v3(conn)
-            _migrate_v3_to_v4(conn)
-            _migrate_v4_to_v5(conn)
-            _migrate_v5_to_v6(conn)
-            _migrate_v6_to_v7(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif current_version == 3:
-            _migrate_v3_to_v4(conn)
-            _migrate_v4_to_v5(conn)
-            _migrate_v5_to_v6(conn)
-            _migrate_v6_to_v7(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif current_version == 4:
-            _migrate_v4_to_v5(conn)
-            _migrate_v5_to_v6(conn)
-            _migrate_v6_to_v7(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif current_version == 5:
-            _migrate_v5_to_v6(conn)
-            _migrate_v6_to_v7(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif current_version == 6:
-            _migrate_v6_to_v7(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """Run every migration needed to reach the current schema, from ANY prior
+    state, inside the caller's (already-open) transaction.
+
+    Every step is individually idempotent (guarded by column/table probes), so
+    the full tail is safe to run from any starting shape — which also self-heals
+    a store whose tables are already modern but whose user_version is stale
+    (e.g. after a crashed fresh-init). Legacy v1 (TEXT `registered_at`) is the
+    only non-additive starting point and is detected by that column; everything
+    from v2 up is reached by the additive/rebuild steps below.
+    """
+    has_agents = (
+        conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agents'").fetchone()
+        is not None
+    )
+    if not has_agents:
+        _create_current_schema(conn)  # truly fresh DB
+        return
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(agents)")}
+    if "registered_at" in cols:  # v1 TEXT-timestamp shape (rebuild required)
+        _migrate_v1_to_v2(conn)
+    _migrate_v2_to_v3(conn)
+    _migrate_v3_to_v4(conn)
+    _migrate_v4_to_v5(conn)
+    _migrate_v5_to_v6(conn)
+    _migrate_v6_to_v7(conn)
 
 
 def _create_current_schema(conn: sqlite3.Connection) -> None:
@@ -524,63 +533,54 @@ def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
     (NOT NULL) with token_hash = sha256(token), and add nullable reclaim_hash.
 
     SQLite can't drop/rename a NOT NULL column in place, so this is a table
-    rebuild (rename → create v7 → copy with hash → drop backup), stamping
-    user_version=7 INSIDE the transaction so a crash can't leave a v6-shaped
-    table at version 0/6 that re-runs the rebuild. Idempotent: a table already
-    carrying token_hash is left untouched.
+    rebuild (rename → create v7 → copy with hash → drop backup). Runs inside the
+    caller's transaction (init_schema owns the single BEGIN IMMEDIATE and stamps
+    user_version); this function manages no transaction of its own. Idempotent:
+    a table already carrying token_hash is left untouched.
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(agents)")}
     if "token_hash" in cols:
         return  # already v7-shaped
 
     conn.execute("DROP TABLE IF EXISTS agents_v6_backup")
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        conn.execute("ALTER TABLE agents RENAME TO agents_v6_backup")
-        # Create ONLY the v7 agents table here (not _create_current_schema, which
-        # also re-touches messages/index and would trip on a legacy messages
-        # shape). messages is unchanged by v7.
-        conn.execute(
-            """
-            CREATE TABLE agents (
-                name              TEXT PRIMARY KEY,
-                working_on        TEXT,
-                registered_at_ms  INTEGER NOT NULL,
-                last_seen_ms      INTEGER NOT NULL,
-                token_hash        TEXT NOT NULL,
-                status            TEXT,
-                status_detail     TEXT,
-                session_id        TEXT,
-                reclaim_hash      TEXT
-            )
-            """
+    conn.execute("ALTER TABLE agents RENAME TO agents_v6_backup")
+    # Create ONLY the v7 agents table here (not _create_current_schema, which
+    # also re-touches messages/index and would trip on a legacy messages shape).
+    conn.execute(
+        """
+        CREATE TABLE agents (
+            name              TEXT PRIMARY KEY,
+            working_on        TEXT,
+            registered_at_ms  INTEGER NOT NULL,
+            last_seen_ms      INTEGER NOT NULL,
+            token_hash        TEXT NOT NULL,
+            status            TEXT,
+            status_detail     TEXT,
+            session_id        TEXT,
+            reclaim_hash      TEXT
         )
-        for r in conn.execute(
-            "SELECT name, working_on, registered_at_ms, last_seen_ms, "
-            "session_token, status, status_detail, session_id FROM agents_v6_backup"
-        ).fetchall():
-            conn.execute(
-                "INSERT INTO agents (name, working_on, registered_at_ms, "
-                "last_seen_ms, token_hash, status, status_detail, session_id, "
-                "reclaim_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
-                (
-                    r["name"],
-                    r["working_on"],
-                    r["registered_at_ms"],
-                    r["last_seen_ms"],
-                    token_hash(r["session_token"]),
-                    r["status"],
-                    r["status_detail"],
-                    r["session_id"],
-                ),
-            )
-        conn.execute("DROP TABLE agents_v6_backup")
-        conn.execute("PRAGMA user_version = 7")
-        conn.execute("COMMIT")
-    except Exception:
-        with suppress(sqlite3.OperationalError):
-            conn.execute("ROLLBACK")
-        raise
+        """
+    )
+    for r in conn.execute(
+        "SELECT name, working_on, registered_at_ms, last_seen_ms, "
+        "session_token, status, status_detail, session_id FROM agents_v6_backup"
+    ).fetchall():
+        conn.execute(
+            "INSERT INTO agents (name, working_on, registered_at_ms, "
+            "last_seen_ms, token_hash, status, status_detail, session_id, "
+            "reclaim_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            (
+                r["name"],
+                r["working_on"],
+                r["registered_at_ms"],
+                r["last_seen_ms"],
+                token_hash(r["session_token"]),
+                r["status"],
+                r["status_detail"],
+                r["session_id"],
+            ),
+        )
+    conn.execute("DROP TABLE agents_v6_backup")
 
 
 def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
@@ -613,12 +613,14 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
 
     The correct migration is a table rebuild: rename → create clean → copy
     with conversion → drop backup. SQLite's ALTER TABLE cannot relax a
-    NOT NULL constraint, so this is the only path. Wrapped in an explicit
-    IMMEDIATE transaction so a crash mid-migration leaves the DB in a
-    consistent state (either fully v1 or fully v2, never a broken hybrid).
+    NOT NULL constraint, so this is the only path. Runs inside the caller's
+    transaction (init_schema owns the single BEGIN IMMEDIATE and stamps
+    user_version atomically); this function manages no transaction of its own.
 
-    Idempotent: if a prior partial migration left backup tables around,
-    they are dropped up front before the rename.
+    Idempotent: leftover backup tables from an interrupted run are dropped up
+    front. Robust to a corrupted v1 table that lacks the name PRIMARY KEY:
+    duplicate names are de-duplicated via ON CONFLICT rather than aborting the
+    whole migration (which would strand the store).
     """
     # Belt-and-suspenders: clear any leftover backup tables from a
     # previously-interrupted migration attempt. DROP IF EXISTS is a no-op
@@ -626,77 +628,61 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE IF EXISTS agents_v1_backup")
     conn.execute("DROP TABLE IF EXISTS messages_v1_backup")
 
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        # 1. Move the v1 tables out of the way
-        conn.execute("ALTER TABLE agents RENAME TO agents_v1_backup")
-        conn.execute("ALTER TABLE messages RENAME TO messages_v1_backup")
+    # 1. Move the v1 tables out of the way
+    conn.execute("ALTER TABLE agents RENAME TO agents_v1_backup")
+    conn.execute("ALTER TABLE messages RENAME TO messages_v1_backup")
 
-        # 2. Create the fresh v2 tables (identical shape to _create_v2_schema)
-        _create_v2_schema(conn)
+    # 2. Create the fresh v2 tables (identical shape to _create_v2_schema)
+    _create_v2_schema(conn)
 
-        # 3. Copy agents with timestamp conversion. If an ISO parse fails,
-        #    default to _now_ms() (better than losing the row; the agent
-        #    can re-register to fix its timestamps).
-        for r in conn.execute(
-            "SELECT name, working_on, registered_at, last_seen, session_token FROM agents_v1_backup"
-        ).fetchall():
-            reg_ms = _iso_to_ms(r["registered_at"]) or _now_ms()
-            seen_ms = _iso_to_ms(r["last_seen"]) or reg_ms
-            conn.execute(
-                "INSERT INTO agents (name, working_on, registered_at_ms, "
-                "last_seen_ms, session_token) VALUES (?, ?, ?, ?, ?)",
-                (r["name"], r["working_on"], reg_ms, seen_ms, r["session_token"]),
-            )
+    # 3. Copy agents with timestamp conversion. If an ISO parse fails, default
+    #    to _now_ms() (better than losing the row). ON CONFLICT keeps the most
+    #    recently-seen row so a duplicate name in a corrupted v1 table can't
+    #    abort the migration.
+    for r in conn.execute(
+        "SELECT name, working_on, registered_at, last_seen, session_token FROM agents_v1_backup"
+    ).fetchall():
+        reg_ms = _iso_to_ms(r["registered_at"]) or _now_ms()
+        seen_ms = _iso_to_ms(r["last_seen"]) or reg_ms
+        conn.execute(
+            "INSERT INTO agents (name, working_on, registered_at_ms, "
+            "last_seen_ms, session_token) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET "
+            "working_on = excluded.working_on, "
+            "session_token = excluded.session_token, "
+            "registered_at_ms = MIN(agents.registered_at_ms, excluded.registered_at_ms), "
+            "last_seen_ms = MAX(agents.last_seen_ms, excluded.last_seen_ms)",
+            (r["name"], r["working_on"], reg_ms, seen_ms, r["session_token"]),
+        )
 
-        # 4. Copy messages. Unparseable expires_at → 0 so the next lazy
-        #    purge cleans up the orphan; unparseable sent_at → _now_ms()
-        #    (better to have the message with an approximate timestamp
-        #    than to lose it).
-        for r in conn.execute(
-            "SELECT id, recipient_name, sender_name, subject, body, "
-            "sent_at, read_at, expires_at FROM messages_v1_backup ORDER BY id ASC"
-        ).fetchall():
-            sent_ms = _iso_to_ms(r["sent_at"]) or _now_ms()
-            read_ms = _iso_to_ms(r["read_at"]) if r["read_at"] else None
-            exp_ms = _iso_to_ms(r["expires_at"]) or 0
-            conn.execute(
-                "INSERT INTO messages (id, recipient_name, sender_name, subject, "
-                "body, sent_at_ms, read_at_ms, expires_at_ms) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    r["id"],
-                    r["recipient_name"],
-                    r["sender_name"],
-                    r["subject"],
-                    r["body"],
-                    sent_ms,
-                    read_ms,
-                    exp_ms,
-                ),
-            )
+    # 4. Copy messages. Unparseable expires_at → 0 so the next lazy purge cleans
+    #    up the orphan; unparseable sent_at → _now_ms().
+    for r in conn.execute(
+        "SELECT id, recipient_name, sender_name, subject, body, "
+        "sent_at, read_at, expires_at FROM messages_v1_backup ORDER BY id ASC"
+    ).fetchall():
+        sent_ms = _iso_to_ms(r["sent_at"]) or _now_ms()
+        read_ms = _iso_to_ms(r["read_at"]) if r["read_at"] else None
+        exp_ms = _iso_to_ms(r["expires_at"]) or 0
+        conn.execute(
+            "INSERT INTO messages (id, recipient_name, sender_name, subject, "
+            "body, sent_at_ms, read_at_ms, expires_at_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                r["id"],
+                r["recipient_name"],
+                r["sender_name"],
+                r["subject"],
+                r["body"],
+                sent_ms,
+                read_ms,
+                exp_ms,
+            ),
+        )
 
-        # 5. Drop the backup tables and any legacy index
-        conn.execute("DROP TABLE agents_v1_backup")
-        conn.execute("DROP TABLE messages_v1_backup")
-
-        # 6. Stamp user_version = 2 INSIDE this transaction so the rebuild and
-        #    the version bump commit atomically. Without this, a crash after
-        #    COMMIT but before init_schema's outer `PRAGMA user_version =
-        #    SCHEMA_VERSION` would leave user_version=0 with v2-shaped tables;
-        #    the next init_schema would re-enter the v1 path, rename the v2
-        #    `agents` to backup, then `SELECT registered_at` (a v1-only column)
-        #    → "no such column" → every tool call raises. Committing the bump
-        #    with the rebuild makes the post-crash version either 1 (rolled
-        #    back) or 2 (done) — never the brick state. The additive 2→3→4→5
-        #    steps are independently idempotent.
-        conn.execute("PRAGMA user_version = 2")
-
-        conn.execute("COMMIT")
-    except Exception:
-        with suppress(sqlite3.OperationalError):
-            conn.execute("ROLLBACK")
-        raise
+    # 5. Drop the backup tables
+    conn.execute("DROP TABLE agents_v1_backup")
+    conn.execute("DROP TABLE messages_v1_backup")
 
 
 # ── Time helpers ─────────────────────────────────────────────────────────────
