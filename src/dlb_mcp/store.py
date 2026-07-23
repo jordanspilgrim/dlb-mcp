@@ -5,7 +5,8 @@ runs one transaction, closes. No long-running server, no lock file — SQLite
 WAL handles concurrent readers + serialized writers for free.
 
 Schema (v2):
-    agents(name PK, working_on, registered_at_ms, last_seen_ms, session_token)
+    agents(name PK, working_on, registered_at_ms, last_seen_ms, token_hash,
+           status, status_detail, session_id, reclaim_hash)  # v7: hashed at rest
     messages(id PK, recipient_name, sender_name, subject, body,
              sent_at_ms, read_at_ms, expires_at_ms)
 
@@ -63,7 +64,7 @@ DEFAULT_MAX_FIELD_BYTES = 8 * 1024  # 8 KiB
 DEFAULT_MAX_INBOX_MESSAGES = 1000
 DEFAULT_TAKEOVER_AFTER_SECONDS = 24 * 60 * 60  # 24h: matches list_threads' default stale window
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7  # v7: agents store token_hash (not the token) + reclaim_hash
 
 
 def store_path() -> Path:
@@ -154,18 +155,17 @@ def _check_field(value: str | None, label: str) -> None:
         raise DLBError(f"{label} too large: {n} bytes exceeds DLB_MAX_FIELD_BYTES={cap}")
 
 
-def _tokens_equal(provided: str | None, stored: str | None) -> bool:
-    """Constant-time comparison of a provided token against the stored one.
+def _auth_ok(presented: str | None, stored_hash: str | None) -> bool:
+    """True iff `presented` hashes to `stored_hash` (constant-time).
 
-    Returns False if either side is missing rather than raising, so callers can
-    treat "no token supplied" and "wrong token" identically. hmac.compare_digest
-    avoids the early-exit timing signal of ``==`` — belt-and-suspenders here,
-    since recover_token already hands the token out under DLB's cooperative
-    model, but there is no reason to leak comparison timing on a secret.
+    The DB stores only sha256(token), so authentication compares HASHES, never
+    plaintext — a read of the DB yields no usable token. Returns False if either
+    side is missing, so "no token supplied" and "wrong token" are indistinguish-
+    able. compare_digest avoids the early-exit timing signal of ``==``.
     """
-    if not provided or not stored:
+    if not presented or not stored_hash:
         return False
-    return hmac.compare_digest(provided, stored)
+    return hmac.compare_digest(token_hash(presented), stored_hash)
 
 
 def read_receipts_enabled() -> bool:
@@ -349,7 +349,7 @@ def init_schema() -> None:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='agents'"
             ).fetchone()
             if row is None:
-                # Truly fresh — create current schema directly (already v6).
+                # Truly fresh — create current schema directly (already v7).
                 _create_current_schema(conn)
             else:
                 # Legacy v1 DB without a user_version stamp. Migrate all the way up.
@@ -358,6 +358,7 @@ def init_schema() -> None:
                 _migrate_v3_to_v4(conn)
                 _migrate_v4_to_v5(conn)
                 _migrate_v5_to_v6(conn)
+                _migrate_v6_to_v7(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif current_version == 1:
             _migrate_v1_to_v2(conn)
@@ -365,32 +366,43 @@ def init_schema() -> None:
             _migrate_v3_to_v4(conn)
             _migrate_v4_to_v5(conn)
             _migrate_v5_to_v6(conn)
+            _migrate_v6_to_v7(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif current_version == 2:
             _migrate_v2_to_v3(conn)
             _migrate_v3_to_v4(conn)
             _migrate_v4_to_v5(conn)
             _migrate_v5_to_v6(conn)
+            _migrate_v6_to_v7(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif current_version == 3:
             _migrate_v3_to_v4(conn)
             _migrate_v4_to_v5(conn)
             _migrate_v5_to_v6(conn)
+            _migrate_v6_to_v7(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif current_version == 4:
             _migrate_v4_to_v5(conn)
             _migrate_v5_to_v6(conn)
+            _migrate_v6_to_v7(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif current_version == 5:
             _migrate_v5_to_v6(conn)
+            _migrate_v6_to_v7(conn)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        elif current_version == 6:
+            _migrate_v6_to_v7(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 def _create_current_schema(conn: sqlite3.Connection) -> None:
-    """Create v3 (current) tables + index. Uses individual execute() calls
-    (NOT executescript) because executescript disregards isolation_level
-    and commits mid-script — which would close a caller's outer transaction
-    when this is invoked from inside `_migrate_v1_to_v2`."""
+    """Create the CURRENT (v7) tables + index. Individual execute() calls (NOT
+    executescript) so it can run inside a caller's transaction.
+
+    v7 agents store `token_hash` (sha256 of the token) instead of the token, plus
+    `reclaim_hash` (sha256 of the rotating reclaim secret) — no plaintext token
+    at rest. Fresh DBs get this shape directly; upgrades reach it via migrations.
+    """
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS agents (
@@ -398,10 +410,11 @@ def _create_current_schema(conn: sqlite3.Connection) -> None:
             working_on        TEXT,
             registered_at_ms  INTEGER NOT NULL,
             last_seen_ms      INTEGER NOT NULL,
-            session_token     TEXT NOT NULL,
+            token_hash        TEXT NOT NULL,
             status            TEXT,
             status_detail     TEXT,
-            session_id        TEXT
+            session_id        TEXT,
+            reclaim_hash      TEXT
         )
         """
     )
@@ -431,8 +444,43 @@ def _create_current_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-# Kept for backward-compat naming — some tests may reference _create_v2_schema
-_create_v2_schema = _create_current_schema
+def _create_v2_schema(conn: sqlite3.Connection) -> None:
+    """Create the LITERAL v2 tables (agents.session_token, no later columns).
+
+    Used ONLY by the v1→v2 rebuild, which must land on the exact v2 shape and
+    then evolve through the additive v3→v7 migrations. It is decoupled from
+    _create_current_schema on purpose: once v7 dropped the session_token column,
+    aliasing the two would make the v1→v2 INSERT (which writes session_token)
+    fail against a current-shape table."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agents (
+            name              TEXT PRIMARY KEY,
+            working_on        TEXT,
+            registered_at_ms  INTEGER NOT NULL,
+            last_seen_ms      INTEGER NOT NULL,
+            session_token     TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS messages (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipient_name        TEXT NOT NULL,
+            sender_name           TEXT NOT NULL,
+            subject               TEXT,
+            body                  TEXT NOT NULL,
+            sent_at_ms            INTEGER NOT NULL,
+            read_at_ms            INTEGER,
+            expires_at_ms         INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_recipient "
+        "ON messages(recipient_name, read_at_ms, sent_at_ms DESC)"
+    )
 
 
 def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
@@ -460,6 +508,70 @@ def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
     existing = {r["name"] for r in conn.execute("PRAGMA table_info(agents)")}
     if "session_id" not in existing:
         conn.execute("ALTER TABLE agents ADD COLUMN session_id TEXT")
+
+
+def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
+    """v6 → v7: stop storing the plaintext token. Replace agents.session_token
+    (NOT NULL) with token_hash = sha256(token), and add nullable reclaim_hash.
+
+    SQLite can't drop/rename a NOT NULL column in place, so this is a table
+    rebuild (rename → create v7 → copy with hash → drop backup), stamping
+    user_version=7 INSIDE the transaction so a crash can't leave a v6-shaped
+    table at version 0/6 that re-runs the rebuild. Idempotent: a table already
+    carrying token_hash is left untouched.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(agents)")}
+    if "token_hash" in cols:
+        return  # already v7-shaped
+
+    conn.execute("DROP TABLE IF EXISTS agents_v6_backup")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("ALTER TABLE agents RENAME TO agents_v6_backup")
+        # Create ONLY the v7 agents table here (not _create_current_schema, which
+        # also re-touches messages/index and would trip on a legacy messages
+        # shape). messages is unchanged by v7.
+        conn.execute(
+            """
+            CREATE TABLE agents (
+                name              TEXT PRIMARY KEY,
+                working_on        TEXT,
+                registered_at_ms  INTEGER NOT NULL,
+                last_seen_ms      INTEGER NOT NULL,
+                token_hash        TEXT NOT NULL,
+                status            TEXT,
+                status_detail     TEXT,
+                session_id        TEXT,
+                reclaim_hash      TEXT
+            )
+            """
+        )
+        for r in conn.execute(
+            "SELECT name, working_on, registered_at_ms, last_seen_ms, "
+            "session_token, status, status_detail, session_id FROM agents_v6_backup"
+        ).fetchall():
+            conn.execute(
+                "INSERT INTO agents (name, working_on, registered_at_ms, "
+                "last_seen_ms, token_hash, status, status_detail, session_id, "
+                "reclaim_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    r["name"],
+                    r["working_on"],
+                    r["registered_at_ms"],
+                    r["last_seen_ms"],
+                    token_hash(r["session_token"]),
+                    r["status"],
+                    r["status_detail"],
+                    r["session_id"],
+                ),
+            )
+        conn.execute("DROP TABLE agents_v6_backup")
+        conn.execute("PRAGMA user_version = 7")
+        conn.execute("COMMIT")
+    except Exception:
+        with suppress(sqlite3.OperationalError):
+            conn.execute("ROLLBACK")
+        raise
 
 
 def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
@@ -788,7 +900,7 @@ def register(
         conn.execute("BEGIN IMMEDIATE")
         try:
             existing = conn.execute(
-                "SELECT name, last_seen_ms, session_token FROM agents WHERE name = ?",
+                "SELECT name, last_seen_ms, token_hash FROM agents WHERE name = ?",
                 (name,),
             ).fetchone()
 
@@ -799,7 +911,7 @@ def register(
 
             if existing and force:
                 # Gate: either prior_token must match OR holder must be stale.
-                token_matches = _tokens_equal(prior_token, existing["session_token"])
+                token_matches = _auth_ok(prior_token, existing["token_hash"])
                 if not token_matches:
                     age_seconds = (_now_ms() - int(existing["last_seen_ms"])) / 1000
                     if age_seconds < takeover_after_seconds():
@@ -807,7 +919,7 @@ def register(
                         raise TakeoverDenied(name, age_seconds)
 
             now_ms = _now_ms()
-            token = mint_token()
+            token = mint_token()  # random; only sha256(token) is stored
             # Bind this registration to the current harness session (Design 1).
             # None when DLB_SESSION_ID is unset → session-id recovery inactive.
             sid = current_session_id()
@@ -815,15 +927,15 @@ def register(
             if existing:
                 conn.execute(
                     "UPDATE agents SET working_on = ?, last_seen_ms = ?, "
-                    "session_token = ?, session_id = ? WHERE name = ?",
-                    (working_on, now_ms, token, sid, name),
+                    "token_hash = ?, session_id = ? WHERE name = ?",
+                    (working_on, now_ms, token_hash(token), sid, name),
                 )
             else:
                 conn.execute(
                     "INSERT INTO agents (name, working_on, registered_at_ms, "
-                    "last_seen_ms, session_token, status, session_id) "
+                    "last_seen_ms, token_hash, status, session_id) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (name, working_on, now_ms, now_ms, token, "working", sid),
+                    (name, working_on, now_ms, now_ms, token_hash(token), "working", sid),
                 )
             conn.execute("COMMIT")
         except Exception:
@@ -860,13 +972,11 @@ def set_status(name: str, session_token: str, status: str, detail: str | None = 
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            row = conn.execute(
-                "SELECT session_token FROM agents WHERE name = ?", (name,)
-            ).fetchone()
+            row = conn.execute("SELECT token_hash FROM agents WHERE name = ?", (name,)).fetchone()
             if row is None:
                 conn.execute("ROLLBACK")
                 raise DLBError(f"Cannot set status: name '{name}' is not registered.")
-            if not _tokens_equal(session_token, row["session_token"]):
+            if not _auth_ok(session_token, row["token_hash"]):
                 conn.execute("ROLLBACK")
                 raise AuthError(f"Invalid session_token for '{name}'.")
             now_ms = _now_ms()
@@ -887,26 +997,20 @@ def set_status(name: str, session_token: str, status: str, detail: str | None = 
     }
 
 
-def recover_token(name: str) -> dict | None:
-    """Return the live session_token for a registered name — compaction recovery.
+def agent_meta(name: str) -> dict | None:
+    """Registration metadata for `name`, or None if unregistered.
 
-    Fixes the #1 documented dark-agent cause: an agent loses its session_token
-    when context compacts, then cannot read its own inbox. Re-registering does
-    NOT help — it mints a NEW token and trips the takeover gate on the agent's
-    own still-live name. This exposes the token directly.
-
-    Layering note: this store-level function is the RAW accessor and returns a
-    token to any caller. The identity boundary lives in the MCP tool wrapper
-    (server.recover_token), which only returns the token when the calling
-    session owns the name (per-process owned-set, Design 2) or its harness
-    session id matches the one bound at register (Design 1). Direct store access
-    is out of scope under DLB's trust boundary (same as reading the SQLite file).
-    Returns None if `name` is not registered. Pure read — no last_seen bump.
+    Deliberately does NOT return a token: the DB stores only sha256(token), so
+    there is no plaintext token to hand back. The token lives solely in the
+    memory of the process that minted it (the server's owned-token cache). The
+    server uses this to check existence + the bound session_id (Design 1) and
+    the reclaim_hash (the rotating credential) when deciding whether to recover.
     """
     init_schema()
     with _connect() as conn:
         row = conn.execute(
-            "SELECT name, working_on, session_token, last_seen_ms FROM agents WHERE name = ?",
+            "SELECT name, working_on, last_seen_ms, session_id, token_hash, reclaim_hash "
+            "FROM agents WHERE name = ?",
             (name,),
         ).fetchone()
     if row is None:
@@ -914,9 +1018,51 @@ def recover_token(name: str) -> dict | None:
     return {
         "name": row["name"],
         "working_on": row["working_on"],
-        "session_token": row["session_token"],
         "last_seen": _ms_to_dt(int(row["last_seen_ms"])).isoformat(),  # type: ignore[union-attr]
+        "session_id": row["session_id"],
+        "token_hash": row["token_hash"],
+        "reclaim_hash": row["reclaim_hash"],
     }
+
+
+def rotate_token(name: str, new_token: str, *, reclaim_secret: str | None = None) -> bool:
+    """Rotate `name`'s token to `new_token` (store its hash), bind it to the
+    current harness session, bump last_seen, and refresh the sidecar. Optionally
+    rotate the reclaim secret too. Returns False if the name is not registered.
+
+    Used by the server to hand a fresh token to a legitimate returning owner
+    (Design 1 crash-respawn, or a reclaim) without a plaintext token ever being
+    stored. The old token's hash is overwritten → the old token stops working.
+    """
+    init_schema()
+    now_ms = _now_ms()
+    sid = current_session_id()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT name FROM agents WHERE name = ?", (name,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return False
+            if reclaim_secret is not None:
+                conn.execute(
+                    "UPDATE agents SET token_hash = ?, reclaim_hash = ?, "
+                    "session_id = ?, last_seen_ms = ? WHERE name = ?",
+                    (token_hash(new_token), token_hash(reclaim_secret), sid, now_ms, name),
+                )
+            else:
+                conn.execute(
+                    "UPDATE agents SET token_hash = ?, session_id = ?, "
+                    "last_seen_ms = ? WHERE name = ?",
+                    (token_hash(new_token), sid, now_ms, name),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            with suppress(sqlite3.OperationalError):
+                conn.execute("ROLLBACK")
+            raise
+    _write_token_sidecar(name, new_token)
+    return True
 
 
 def bound_session_id(name: str) -> str | None:
@@ -1079,8 +1225,8 @@ def send(
             sender = from_ if from_ is not None else "anonymous"
             if session_token is not None:
                 row = conn.execute(
-                    "SELECT name FROM agents WHERE session_token = ?",
-                    (session_token,),
+                    "SELECT name FROM agents WHERE token_hash = ?",
+                    (token_hash(session_token),),
                 ).fetchone()
                 if row is None:
                     conn.execute("ROLLBACK")
@@ -1171,7 +1317,7 @@ def update_status(
                 raise DLBError(f"No message with id={message_id}")
 
             agent = conn.execute(
-                "SELECT session_token FROM agents WHERE name = ?",
+                "SELECT token_hash FROM agents WHERE name = ?",
                 (msg_row["recipient_name"],),
             ).fetchone()
             if agent is None:
@@ -1180,7 +1326,7 @@ def update_status(
                     f"Cannot update_status for unregistered recipient "
                     f"'{msg_row['recipient_name']}'."
                 )
-            if not _tokens_equal(session_token, agent["session_token"]):
+            if not _auth_ok(session_token, agent["token_hash"]):
                 conn.execute("ROLLBACK")
                 raise AuthError("Invalid session_token for this message's recipient.")
 
@@ -1276,12 +1422,12 @@ def read(
         conn.execute("BEGIN IMMEDIATE")
         try:
             agent_row = conn.execute(
-                "SELECT name, session_token FROM agents WHERE name = ?", (name,)
+                "SELECT name, token_hash FROM agents WHERE name = ?", (name,)
             ).fetchone()
             is_owner = agent_row is not None
 
             if is_owner:
-                if not _tokens_equal(session_token, agent_row["session_token"]):
+                if not _auth_ok(session_token, agent_row["token_hash"]):
                     conn.execute("ROLLBACK")
                     raise AuthError(
                         f"Invalid or missing session_token for registered name '{name}'."
@@ -1401,7 +1547,7 @@ def ack(message_id: int, session_token: str) -> bool:
                 return False
 
             agent = conn.execute(
-                "SELECT session_token FROM agents WHERE name = ?",
+                "SELECT token_hash FROM agents WHERE name = ?",
                 (msg["recipient_name"],),
             ).fetchone()
             if agent is None:
@@ -1409,7 +1555,7 @@ def ack(message_id: int, session_token: str) -> bool:
                 raise AuthError(
                     f"Cannot ack message for unregistered recipient '{msg['recipient_name']}'."
                 )
-            if not _tokens_equal(session_token, agent["session_token"]):
+            if not _auth_ok(session_token, agent["token_hash"]):
                 conn.execute("ROLLBACK")
                 raise AuthError("Invalid session_token for this message's recipient.")
 
@@ -1437,13 +1583,11 @@ def unregister(name: str, session_token: str) -> bool:
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            agent = conn.execute(
-                "SELECT session_token FROM agents WHERE name = ?", (name,)
-            ).fetchone()
+            agent = conn.execute("SELECT token_hash FROM agents WHERE name = ?", (name,)).fetchone()
             if agent is None:
                 conn.execute("ROLLBACK")
                 return False
-            if not _tokens_equal(session_token, agent["session_token"]):
+            if not _auth_ok(session_token, agent["token_hash"]):
                 conn.execute("ROLLBACK")
                 raise AuthError(f"Invalid session_token for '{name}'.")
 

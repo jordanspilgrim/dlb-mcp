@@ -1,4 +1,7 @@
-"""#6 headline field + #4 task read-receipts."""
+"""#6 headline field + #4 task read-receipts.
+
+Tokens are captured from register() (the DB stores only sha256(token), so there
+is no store-level recover_token to fetch them back)."""
 
 from __future__ import annotations
 
@@ -10,9 +13,9 @@ from dlb_mcp import monitor, store
 
 
 def test_headline_round_trips_through_send_and_read():
-    store.register("alpha")
+    tok = store.register("alpha")["session_token"]
     store.send(to="alpha", body="long body here", headline="STATUS: 3/5 done", from_="bravo")
-    msgs = store.read("alpha", session_token=store.recover_token("alpha")["session_token"])
+    msgs = store.read("alpha", session_token=tok)
     assert msgs[0].headline == "STATUS: 3/5 done"
 
 
@@ -28,24 +31,20 @@ def test_monitor_shows_headline_untruncated():
 # ── #4 read-receipts ─────────────────────────────────────────────────────────
 
 
-def _read(name: str):
-    return store.read(name, session_token=store.recover_token(name)["session_token"])
-
-
 def test_task_read_sends_receipt_to_registered_sender():
-    store.register("worker")
-    store.register("boss")
+    worker_t = store.register("worker")["session_token"]
+    boss_t = store.register("boss")["session_token"]
     store.send(
         to="worker",
         body="do X",
         from_="boss",
-        session_token=store.recover_token("boss")["session_token"],
+        session_token=boss_t,
         msg_type="task",
         headline="task: do X",
     )
-    _read("worker")
+    store.read("worker", session_token=worker_t)
 
-    receipts = _read("boss")
+    receipts = store.read("boss", session_token=boss_t)
     assert len(receipts) == 1
     r = receipts[0]
     assert r.msg_type == "receipt"
@@ -54,52 +53,35 @@ def test_task_read_sends_receipt_to_registered_sender():
 
 
 def test_non_task_message_does_not_receipt():
-    store.register("worker")
-    store.register("boss")
-    store.send(
-        to="worker",
-        body="fyi",
-        from_="boss",
-        session_token=store.recover_token("boss")["session_token"],
-    )  # no msg_type
-    _read("worker")
-    assert _read("boss") == []
+    worker_t = store.register("worker")["session_token"]
+    boss_t = store.register("boss")["session_token"]
+    store.send(to="worker", body="fyi", from_="boss", session_token=boss_t)  # no msg_type
+    store.read("worker", session_token=worker_t)
+    assert store.read("boss", session_token=boss_t) == []
 
 
 def test_unregistered_sender_gets_no_receipt():
-    store.register("worker")
+    worker_t = store.register("worker")["session_token"]
     store.send(to="worker", body="do X", from_="ghost", msg_type="task")  # ghost not registered
-    _read("worker")
+    store.read("worker", session_token=worker_t)
     # ghost inbox is a dead-letter; no receipt should have been queued
     assert store.read("ghost", unread_only=True) == []
 
 
 def test_receipt_does_not_generate_a_receipt_no_loop():
-    store.register("worker")
-    store.register("boss")
-    store.send(
-        to="worker",
-        body="do X",
-        from_="boss",
-        session_token=store.recover_token("boss")["session_token"],
-        msg_type="task",
-    )
-    _read("worker")  # -> receipt to boss
-    _read("boss")  # reading the receipt must NOT create a new receipt to worker
+    worker_t = store.register("worker")["session_token"]
+    boss_t = store.register("boss")["session_token"]
+    store.send(to="worker", body="do X", from_="boss", session_token=boss_t, msg_type="task")
+    store.read("worker", session_token=worker_t)  # -> receipt to boss
+    store.read("boss", session_token=boss_t)  # reading the receipt must NOT create a new receipt
     # worker inbox now empty (its only msg was already read); no loop receipt.
-    assert _read("worker") == []
+    assert store.read("worker", session_token=worker_t) == []
 
 
 def test_env_opt_out_disables_receipts(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("DLB_READ_RECEIPTS", "0")
-    store.register("worker")
-    store.register("boss")
-    store.send(
-        to="worker",
-        body="do X",
-        from_="boss",
-        session_token=store.recover_token("boss")["session_token"],
-        msg_type="task",
-    )
-    _read("worker")
-    assert _read("boss") == []
+    worker_t = store.register("worker")["session_token"]
+    boss_t = store.register("boss")["session_token"]
+    store.send(to="worker", body="do X", from_="boss", session_token=boss_t, msg_type="task")
+    store.read("worker", session_token=worker_t)
+    assert store.read("boss", session_token=boss_t) == []

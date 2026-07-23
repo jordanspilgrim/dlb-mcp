@@ -114,12 +114,16 @@ def test_field_cap_is_env_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
 # ── Issue 5: constant-time compare + None rejection ──────────────────────────
 
 
-def test_tokens_equal_rejects_none_and_mismatch() -> None:
-    assert store._tokens_equal("abc", "abc") is True
-    assert store._tokens_equal("abc", "abd") is False
-    assert store._tokens_equal(None, "abc") is False
-    assert store._tokens_equal("abc", None) is False
-    assert store._tokens_equal(None, None) is False
+def test_auth_ok_hashes_and_rejects_none_and_mismatch() -> None:
+    # _auth_ok compares sha256(presented) against the stored hash (constant-time).
+    good = store.token_hash("abc")
+    assert store._auth_ok("abc", good) is True
+    assert store._auth_ok("abd", good) is False
+    assert store._auth_ok(None, good) is False
+    assert store._auth_ok("abc", None) is False
+    assert store._auth_ok(None, None) is False
+    # Sanity: the stored value is a hash, not the token.
+    assert good != "abc" and len(good) == 64
 
 
 def test_read_registered_without_token_is_rejected() -> None:

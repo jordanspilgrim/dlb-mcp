@@ -5,10 +5,23 @@ rests on per-process ownership / session-id / the reclaim credential.
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from dlb_mcp import store
 from dlb_mcp.store import AuthError
+
+
+def test_db_stores_hash_not_plaintext_token() -> None:
+    # Core of the at-rest hardening: the token itself is never written to the DB,
+    # only sha256(token). A read of the SQLite file yields no usable token.
+    tok = store.register("alpha")["session_token"]
+    with sqlite3.connect(str(store.store_path())) as c:
+        stored_hash = c.execute("SELECT token_hash FROM agents WHERE name='alpha'").fetchone()[0]
+        dump = " ".join(str(v) for row in c.execute("SELECT * FROM agents").fetchall() for v in row)
+    assert stored_hash == store.token_hash(tok)
+    assert tok not in dump, "plaintext token must not appear anywhere in the agents table"
 
 
 def test_distinct_names_get_distinct_tokens() -> None:
