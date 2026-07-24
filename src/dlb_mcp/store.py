@@ -1,7 +1,7 @@
 """SQLite-backed store for DLB.
 
 One file, two tables, WAL mode. Every MCP tool call opens a fresh connection,
-runs one transaction, closes. No long-running server, no lock file — SQLite
+runs one transaction, closes. No long-running server, no lock file: SQLite
 WAL handles concurrent readers + serialized writers for free.
 
 Schema (v2):
@@ -25,13 +25,13 @@ against adversarial ones.
 
 Scope of the token, precisely: the MCP tool API never hands one session another
 session's token (recover_token is gated by per-process ownership / session-id),
-and NO plaintext token is stored at rest — the DB holds only sha256(token) and
+and NO plaintext token is stored at rest: the DB holds only sha256(token) and
 the sidecar holds a single-use, rotating RECLAIM SECRET (not the token). The live
 token lives only in the memory of the process that minted it.
 
 What remains out of scope is RAW access (reading files / importing the store).
 But even that no longer yields a usable token: the most a raw-access peer can do
-is read the sidecar's reclaim secret and reclaim a name ONCE — which rotates the
+is read the sidecar's reclaim secret and reclaim a name ONCE, which rotates the
 secret, so it locks out and alerts the legitimate owner (detectable, not silent).
 So `sender_name` is still an attribution HINT rather than a cryptographically
 authenticated fact, but forging it now costs a single-use, detectable takeover.
@@ -59,7 +59,7 @@ DEFAULT_TTL_DAYS = 7
 DEFAULT_MAX_BODY_BYTES = 256 * 1024  # 256 KiB
 # Short metadata fields (name, to, from_, subject, headline, msg_type). The body
 # has its own, much larger cap; everything else is a one-liner-ish string and an
-# unbounded value here is pure abuse surface — `headline` in particular is
+# unbounded value here is pure abuse surface; `headline` in particular is
 # surfaced UNTRUNCATED into monitor previews, so a giant one floods LLM context.
 DEFAULT_MAX_FIELD_BYTES = 8 * 1024  # 8 KiB
 # Ring-buffer bound per recipient inbox: on send, if an inbox exceeds this many
@@ -80,7 +80,7 @@ def store_path() -> Path:
 # bind and raised a raw OverflowError from send()/etc. before it was clamped.
 _INT64_MAX = 2**63 - 1
 # Cap TTL so `sent_ms + ttl*ms_per_day` stays a valid Python datetime (year
-# <= 9999) — the return path formats expires_at via datetime.isoformat(), which
+# <= 9999); the return path formats expires_at via datetime.isoformat(), which
 # raises well before int64 overflow. 365,000 days ≈ 1000 years is effectively
 # "never expires" while keeping every derived timestamp representable.
 _MAX_TTL_DAYS = 365_000
@@ -136,13 +136,13 @@ def max_inbox_messages() -> int:
 def current_session_id() -> str | None:
     """The harness session id for THIS dlb-mcp process (Design 1), or None.
 
-    Read server-side from DLB_SESSION_ID — the deployment wires it from whatever
+    Read server-side from DLB_SESSION_ID; the deployment wires it from whatever
     stable per-session id the harness exposes (e.g. CLAUDE_CODE_SESSION_ID) via
     the MCP config `env` block or a launch wrapper. Because the server reads it
     from its OWN environment, the caller (agent) never handles it: compaction
     can't lose it, and a peer can't forge it by passing an argument.
 
-    MUST be unique per session for the recovery boundary to hold — a stable
+    MUST be unique per session for the recovery boundary to hold. A stable
     harness session id is; two sessions sharing one value would share identity.
     Empty/unset → None, which never matches (recovery falls back to the
     per-process owned-set + stale-gate).
@@ -159,8 +159,8 @@ def current_session_id() -> str | None:
 # the monitor ALSO sanitizes at its sink (defense in depth). Ordinary unicode
 # names ("alpha", "ThreadBeta", "worker-1", "ré视") are unaffected.
 # C0 controls + DEL + C1 controls (incl. NEL U+0085) + LINE/PARAGRAPH SEPARATOR.
-# The extra range beyond C0 matters because Python's str.splitlines() — and many
-# terminals/log viewers — treat NEL/U+2028/U+2029 as line boundaries, so a value
+# The extra range beyond C0 matters because Python's str.splitlines() (and many
+# terminals/log viewers) treat NEL/U+2028/U+2029 as line boundaries, so a value
 # containing one could otherwise forge a second dlb-monitor event line.
 _CONTROL_CHARS_RE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
@@ -186,7 +186,7 @@ def _auth_ok(presented: str | None, stored_hash: str | None) -> bool:
     """True iff `presented` hashes to `stored_hash` (constant-time).
 
     The DB stores only sha256(token), so authentication compares HASHES, never
-    plaintext — a read of the DB yields no usable token. Returns False if either
+    plaintext; a read of the DB yields no usable token. Returns False if either
     side is missing, so "no token supplied" and "wrong token" are indistinguish-
     able. compare_digest avoids the early-exit timing signal of ``==``.
     """
@@ -209,11 +209,11 @@ def read_receipts_enabled() -> bool:
 # ── Token identity (random, hashed at rest) ──────────────────────────────────
 # Tokens are high-entropy random strings, NOT derived from any on-disk secret.
 # The DB stores only sha256(token) (the agents.token_hash column), so reading the
-# SQLite file — or a direct ``import dlb_mcp.store`` — yields only a hash, never a
+# SQLite file (or a direct ``import dlb_mcp.store``) yields only a hash, never a
 # usable token. The live token exists solely in the memory of the process that
 # minted it (the server-side owned-token cache) and in the client that called
 # register. A force-takeover mints a FRESH token, invalidating the prior
-# holder's — restoring real eviction (the earlier deterministic scheme could not
+# holder's, restoring real eviction (the earlier deterministic scheme could not
 # rotate, since the token was a pure function of the name).
 
 
@@ -223,7 +223,7 @@ def mint_token() -> str:
 
 
 def token_hash(token: str) -> str:
-    """sha256 hex of a token — what the DB stores at rest. A random 256-bit token
+    """sha256 hex of a token, what the DB stores at rest. A random 256-bit token
     has no low-entropy preimage to brute-force, so a plain fast hash (no salt or
     KDF) is sufficient; the point is only to keep plaintext off disk."""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -237,8 +237,8 @@ def tokens_dir() -> Path:
 def _sidecar_filename(name: str) -> str:
     """Injective, filesystem-safe sidecar filename: sha256(name) hex.
 
-    A lossy sanitizer (the old `re.sub(...)`) mapped distinct names — e.g.
-    'a/b', 'a_b', 'a b' — onto ONE file, so registering one name would clobber
+    A lossy sanitizer (the old `re.sub(...)`) mapped distinct names (e.g.
+    'a/b', 'a_b', 'a b') onto ONE file, so registering one name would clobber
     another's reclaim credential. Hashing is collision-free and cannot escape
     the tokens dir. The human-readable name still lives on line 1 of the file's
     contents (read by the SessionStart hook), so nothing is lost for display."""
@@ -254,14 +254,14 @@ def sidecar_path(name: str) -> Path:
     The secret is single-use and rotates on every register/reclaim, so a stolen
     sidecar works at most once and is detectable (a later attempt with the same
     secret fails). No plaintext TOKEN is ever written here. Reading the file is
-    file-layer access — out of scope for the tool-API boundary."""
+    file-layer access, out of scope for the tool-API boundary."""
     return tokens_dir() / _sidecar_filename(name)
 
 
 def _write_reclaim_sidecar(name: str, reclaim_secret: str) -> None:
     """Persist name→reclaim_secret under <store_dir>/tokens/<sha256(name)> (chmod
     600) so the SessionStart hook can rediscover registered names and a returning
-    owner can reclaim. Best-effort — never blocks register. Holds the reclaim
+    owner can reclaim. Best-effort, never blocks register. Holds the reclaim
     secret, NOT the token (the token is never written to disk)."""
     d = tokens_dir()
     with suppress(OSError):
@@ -309,7 +309,7 @@ class Message:
     expires_at: datetime
     # v3 lifecycle fields (all optional/None on legacy rows)
     msg_type: str | None = None  # advisory tag from sender; convention: "task"
-    in_reply_to: int | None = None  # references messages.id — sender-set
+    in_reply_to: int | None = None  # references messages.id, sender-set
     status: str | None = None  # recipient-set; convention: queued/accepted/running/done/blocked
     status_note: str | None = None  # recipient-set free-text detail on status
     status_updated_at: datetime | None = None
@@ -372,7 +372,7 @@ def _connect() -> Iterator[sqlite3.Connection]:
 
 
 def init_schema() -> None:
-    """Bring the store to the current schema — atomically and race-safely.
+    """Bring the store to the current schema, atomically and race-safely.
 
     The entire check-and-migrate runs in ONE `BEGIN IMMEDIATE` transaction with
     double-checked locking: N concurrent processes serialize on the write lock;
@@ -427,7 +427,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     state, inside the caller's (already-open) transaction.
 
     Every step is individually idempotent (guarded by column/table probes), so
-    the full tail is safe to run from any starting shape — which also self-heals
+    the full tail is safe to run from any starting shape, which also self-heals
     a store whose tables are already modern but whose user_version is stale
     (e.g. after a crashed fresh-init). Legacy v1 (TEXT `registered_at`) is the
     only non-additive starting point and is detected by that column; everything
@@ -659,7 +659,7 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
 
     v1 stored timestamps as TEXT ISO strings; v2 stores INTEGER epoch-ms.
     An earlier draft of this migration used ADD COLUMN + backfill and left
-    the legacy TEXT columns in place — but v2 INSERT statements don't
+    the legacy TEXT columns in place, but v2 INSERT statements don't
     populate them, and the legacy columns declare NOT NULL, so every send
     or register on a migrated DB failed with "NOT NULL constraint failed".
 
@@ -938,7 +938,7 @@ def register(
     if not name or not isinstance(name, str):
         raise DLBError("name must be a non-empty string")
     # A name flows into sender_name on authenticated sends, into the monitor
-    # notification line, and into the SessionStart hook output — reject control
+    # notification line, and into the SessionStart hook output; reject control
     # chars (newline-injection) and cap the size, same as any metadata field.
     _check_field(name, "name")
     _check_field(working_on, "working_on")
@@ -958,8 +958,8 @@ def register(
 
             if existing and force:
                 # Gate: prior_token may be the current TOKEN (a handoff) OR the
-                # rotating RECLAIM SECRET from the sidecar (a full-restart reclaim)
-                # — either bypasses the stale-gate. Otherwise the holder must be
+                # rotating RECLAIM SECRET from the sidecar (a full-restart reclaim);
+                # either bypasses the stale-gate. Otherwise the holder must be
                 # stale. Both credentials are single-use here: this register
                 # rotates them below, so a stolen sidecar works at most once and a
                 # later attempt with the same secret fails (tamper-evident).
@@ -1007,7 +1007,7 @@ def register(
                 conn.execute("ROLLBACK")
             raise
 
-    # The sidecar holds the RECLAIM SECRET (not the token) — a returning owner
+    # The sidecar holds the RECLAIM SECRET (not the token); a returning owner
     # reads it and calls register(force=True, prior_token=<secret>).
     _write_reclaim_sidecar(name, reclaim_secret)
 
@@ -1026,7 +1026,7 @@ def set_status(name: str, session_token: str, status: str, detail: str | None = 
 
     Convention (not enforced): status ∈ {working, idle, blocked, done}; any
     string is accepted. `detail` is optional free text (e.g. what you're blocked
-    on). Requires the name's session_token. Also bumps last_seen — reporting
+    on). Requires the name's session_token. Also bumps last_seen; reporting
     status is itself a heartbeat, so `list_threads` can distinguish a
     quiet-but-alive agent from a stopped one. Returns the updated summary.
     """
@@ -1215,15 +1215,15 @@ def send(
     `to` is not registered. Messages queue under the name and surface when
     someone reads it.
 
-    Provenance (read this carefully — it is weaker than it looks):
+    Provenance (read this carefully; it is weaker than it looks):
     - Without session_token: `from_` is the literal string the caller passed
-      (defaulting to "anonymous"). No verification — the sender label is
+      (defaulting to "anonymous"). No verification: the sender label is
       free text and could be a lie.
     - With session_token: the token is looked up; if `from_` is omitted, it
       becomes the token's registered name; if `from_` is supplied, it MUST
       equal the token's name or AuthError is raised.
     - What this does NOT give you: unforgeable provenance. No token is stored at
-      rest, so a peer can't simply read one — but a same-user peer with RAW file
+      rest, so a peer can't simply read one, but a same-user peer with RAW file
       access could read the sidecar's single-use reclaim secret and hijack X
       once (which rotates the secret → detectable). `sender_name` is therefore an
       attribution HINT, not proof of origin. Acceptable under DLB's cooperative
@@ -1232,22 +1232,22 @@ def send(
     Size caps (all reject with DLBError on overflow):
     - body bytes (UTF-8) must be <= DLB_MAX_BODY_BYTES (default 256KiB).
     - to / from_ / subject / headline / msg_type each <= DLB_MAX_FIELD_BYTES
-      (default 8KiB) and must contain no control characters — they are surfaced
+      (default 8KiB) and must contain no control characters; they are surfaced
       into notifications and hook output where a newline could forge an event.
 
     Inbox cap: send ALWAYS succeeds, but the recipient's inbox is a ring buffer
     of at most DLB_MAX_INBOX messages (default 1000). On overflow the OLDEST
-    messages are dropped to bound row growth from a send flood — under sustained
+    messages are dropped to bound row growth from a send flood; under sustained
     flooding this can drop a real queued message. Set DLB_MAX_INBOX=0 to disable.
 
     Lifecycle hints (v0.3.0+):
     - msg_type: advisory tag. Convention: `"task"` signals to the recipient
       that this message expects action + acknowledgment. DLB does not enforce
-      any type-based behavior — enforcement is at the client (CLAUDE.md
+      any type-based behavior; enforcement is at the client (CLAUDE.md
       protocol level).
     - in_reply_to: id of a message this one is replying to. Enables the
       sender to correlate task acknowledgments and status updates back to
-      the original task. Soft reference — not a foreign key; a stale id
+      the original task. Soft reference, not a foreign key; a stale id
       is stored as-is.
     """
     init_schema()
@@ -1278,7 +1278,7 @@ def send(
 
     # Single connection + explicit BEGIN IMMEDIATE so the token lookup and
     # the insert are one atomic unit. Prior implementation used two separate
-    # _connect() contexts — a benign TOCTOU: the token could be unregistered
+    # _connect() contexts, a benign TOCTOU: the token could be unregistered
     # between lookup and insert, worst case binding sender_name to a name
     # whose holder had just departed. No safety hole, but airtight is cheap
     # when the fix is one connection.
@@ -1365,11 +1365,11 @@ def update_status(
 
     Auth: session_token must match the message's recipient (they're the
     one running the task). If the recipient is unregistered, status
-    updates are rejected — there's no owner to authenticate as.
+    updates are rejected; there's no owner to authenticate as.
 
     Side effect: sets read_at_ms if not already set (a status update
     implies you've read the message). Deprecates the read/ack distinction
-    tentatively reserved in v1 — update_status IS the future of ack.
+    tentatively reserved in v1; update_status IS the future of ack.
 
     Returns the updated Message so the caller can echo it back to the
     sender if desired.
@@ -1429,7 +1429,7 @@ def update_status(
 def get_task_status(message_id: int) -> dict | None:
     """Return the lifecycle status of a message without reading it (v0.3.0+).
 
-    No auth required — DLB's trust model is coordination between cooperating
+    No auth required: DLB's trust model is coordination between cooperating
     agents under the same OS user, and knowing "did my task get picked up?"
     is exactly the kind of query a sender needs to make against a recipient's
     inbox without holding the recipient's token.
@@ -1437,7 +1437,7 @@ def get_task_status(message_id: int) -> dict | None:
     Returns None if the message id doesn't exist. Otherwise a dict with
     the id, msg_type, status, status_note, status_updated_at (ISO),
     read_at (ISO if read, else None), and in_reply_to fields. Body/subject
-    are NOT returned — this is a lightweight status probe, not a content
+    are NOT returned; this is a lightweight status probe, not a content
     read.
     """
     init_schema()
@@ -1481,7 +1481,7 @@ def read(
     - If `name` IS registered: session_token must match. Otherwise AuthError.
       Messages returned are marked read (and TASK messages generate receipts).
     - If `name` IS NOT registered: anyone can read (no owner to protect), but
-      this is a NON-DESTRUCTIVE PEEK — messages are returned WITHOUT being
+      this is a NON-DESTRUCTIVE PEEK; messages are returned WITHOUT being
       marked read. That preserves DLB's core dead-letter guarantee: a message
       queued for a not-yet-registered name is still unread (and still surfaced
       by the default unread_only read + the SessionStart reminder) when the
@@ -1529,7 +1529,7 @@ def read(
 
             # Mark read ONLY when the authenticated owner is reading. An
             # unregistered-name peek is deliberately non-destructive (see
-            # docstring) — it leaves read_at NULL so the mail is still waiting
+            # docstring); it leaves read_at NULL so the mail is still waiting
             # for whoever eventually claims the name. Capture the exact ms value
             # we write so the returned objects' read_at matches the DB to the
             # millisecond (avoids a "stored vs. returned" drift bug).
@@ -1547,12 +1547,12 @@ def read(
             # lightweight receipt back to its sender so they learn it was seen
             # without polling. Guards: task-type only; a real registered recipient
             # is reading (not a dead-letter peek); skip anonymous/self-sends; the
-            # ORIGINAL send must have been AUTHENTICATED (session-token-backed) —
+            # ORIGINAL send must have been AUTHENTICATED (session-token-backed);
             # otherwise `sender_name` is a spoofable free-text `from_` and we'd
             # author false-attribution receipts into an uninvolved agent's inbox;
             # and receipts are msg_type='receipt' (never 'task') so they never
             # generate further receipts. The receipt INSERTs also obey the inbox
-            # ring buffer (enforced per recipient below) — the send() path is not
+            # ring buffer (enforced per recipient below); the send() path is not
             # the only writer, so the cap must be applied here too.
             if (
                 ids
@@ -1574,7 +1574,7 @@ def read(
                     origin = r["sender_name"]
                     if origin in (None, "anonymous", name):
                         continue
-                    # Only receipt a sender that actually holds an inbox — a
+                    # Only receipt a sender that actually holds an inbox; a
                     # receipt to an unregistered/spoofed name is dead-letter noise.
                     if (
                         conn.execute("SELECT 1 FROM agents WHERE name = ?", (origin,)).fetchone()
@@ -1621,11 +1621,11 @@ def read(
 def ack(message_id: int, session_token: str) -> bool:
     """Mark a message as acknowledged (separate from read).
 
-    Currently we treat ack as 'definitely read' — we set read_at if it's
+    Currently we treat ack as 'definitely read'; we set read_at if it's
     still NULL. The distinction between read and ack is for future use.
 
     Auth: the caller must hold a valid session_token for the message's
-    recipient. (If the recipient is unregistered, ack is a no-op — there's
+    recipient. (If the recipient is unregistered, ack is a no-op; there's
     no owner to take responsibility.)
     """
     init_schema()
@@ -1670,7 +1670,7 @@ def ack(message_id: int, session_token: str) -> bool:
 def unregister(name: str, session_token: str) -> bool:
     """Release a name.
 
-    Messages addressed to that name are PRESERVED — re-registration (by
+    Messages addressed to that name are PRESERVED; re-registration (by
     anyone) gives access to them again. The "name holder" abstraction is
     over agent presence, not over message ownership.
     """

@@ -1,23 +1,23 @@
-"""``dlb-session-recover`` — Claude Code SessionStart hook entry point.
+"""``dlb-session-recover``: Claude Code SessionStart hook entry point.
 
 Prints the DLB names registered on this machine so an agent that lost its
 session_token knows how to get its identity back. There are two cases:
 
   • Same session, post-compaction: ``mcp__dlb__recover_token(name)`` returns
-    the token (the dlb-mcp process — which owns the name — outlived compaction).
+    the token (the dlb-mcp process, which owns the name, outlived compaction).
   • Full restart (quit+reopen, or --resume, which rotates the session):
     recover_token is refused because a new process does not own the name and
     the session id changed. Reclaim instantly by reading the persisted token
     from the sidecar and calling register(force=True, prior_token=<token>),
     which bypasses the stale-gate (the token matches). Reading the sidecar is
-    file access — a peer using only the tool API cannot do it, so the boundary
+    file access; a peer using only the tool API cannot do it, so the boundary
     holds.
 
 Clean no-op (prints nothing, exits 0) when no names have been registered yet,
 so it is safe to wire unconditionally into every session start.
 
 Packaged as a console script (``dlb-session-recover``) so it is on PATH on any
-machine after ``uv tool install dlb-mcp`` — no repo checkout or absolute path
+machine after ``uv tool install dlb-mcp``, no repo checkout or absolute path
 required. Wire it with ``dlb-mcp setup``.
 """
 
@@ -66,7 +66,7 @@ def main() -> None:
         "    register(name, force=true, prior_token=<that secret>) to reclaim instantly.\n"
     )
     # Sidecar filenames are sha256(name) hashes, so print each name's RESOLVED
-    # path — the generic "tokens/<name>" no longer locates the file.
+    # path; the generic "tokens/<name>" no longer locates the file.
     for n in names:
         out.write(f"  - {n}  →  {store.sidecar_path(n)}\n")
 

@@ -14,7 +14,7 @@ build/
 
 # uv
 .venv/
-# uv.lock IS committed — gives reproducible CI + dev environments.
+# uv.lock IS committed for reproducible CI + dev environments.
 # It only affects local installs / CI, not what consumers get via pip install.
 
 # IDE

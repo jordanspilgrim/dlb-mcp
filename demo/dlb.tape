@@ -1,4 +1,4 @@
-# dlb.tape — two-terminal (tmux split) demo, rendered deterministically.
+# dlb.tape: two-terminal (tmux split) demo, rendered deterministically.
 #
 #   brew install vhs        # one-time (pulls ttyd + ffmpeg)
 #   vhs demo/dlb.tape       # run from the repo root -> writes docs/demo.gif

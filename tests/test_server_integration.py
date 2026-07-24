@@ -1,7 +1,7 @@
 """End-to-end integration test: spawn the MCP server via stdio,
 drive it with raw JSON-RPC, verify all 6 tools work over the wire.
 
-This test exercises the same code path Claude Code uses — proves the
+This test exercises the same code path Claude Code uses, proves the
 server actually negotiates MCP, registers its tools, and responds to
 tool calls without us hand-waving the transport.
 """
@@ -120,7 +120,7 @@ def _call(server: subprocess.Popen, call_id: int, tool: str, args: dict) -> dict
 
 def test_full_happy_path(server: subprocess.Popen) -> None:
     """Tool catalog → register → send → read → ack → unregister."""
-    # 1. List tools — the full DLB tool catalog (9 as of v0.3.1).
+    # 1. List tools: the full DLB tool catalog (9 as of v0.3.1).
     tools_resp = _send_rpc(server, [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}])
     assert tools_resp
     tools = tools_resp[0]["result"]["tools"]
@@ -150,7 +150,7 @@ def test_full_happy_path(server: subprocess.Popen) -> None:
     assert sent["sender_name"] == "anonymous"
     msg_id = sent["id"]
 
-    # 4. Read alpha's inbox with the token — should find the message
+    # 4. Read alpha's inbox with the token, should find the message
     inbox = _call(
         server,
         4,
@@ -179,7 +179,7 @@ def test_send_to_nonexistent_succeeds(server: subprocess.Popen) -> None:
     assert sent["recipient_name"] == "ghost"
     assert sent["id"] > 0
 
-    # Read unregistered name without a token — must work
+    # Read unregistered name without a token, must work
     inbox = _call(server, 2, "read", {"name": "ghost"})
     if isinstance(inbox, dict) and "result" in inbox:
         inbox = inbox["result"]

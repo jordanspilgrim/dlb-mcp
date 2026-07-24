@@ -1,4 +1,4 @@
-"""Design 2 — per-process (per-session) ownership gate on recover_token.
+"""Design 2: per-process (per-session) ownership gate on recover_token.
 
 Closes Issue 1's tool-API leak: recover_token used to hand ANY name's token to
 ANY caller. Now the dlb-mcp server process only returns a token for a name that
@@ -10,9 +10,9 @@ not a full restart), this gives:
     a brand-new process (restart)  → refused; reclaim via register(force=True)
 
 Two layers of test:
-  * unit — direct calls to the server tool functions, resetting the process
+  * unit: direct calls to the server tool functions, resetting the process
     ownership set between cases to simulate distinct sessions (fast).
-  * e2e  — two REAL dlb-mcp processes over stdio JSON-RPC sharing one store,
+  * e2e: two REAL dlb-mcp processes over stdio JSON-RPC sharing one store,
     proving the boundary end to end across actual OS processes.
 """
 
@@ -117,7 +117,7 @@ def _send_rpc(proc: subprocess.Popen, messages: list[dict]) -> list[dict]:
 def _session(store_path: Path, session_id: str | None = None) -> Iterator[subprocess.Popen]:
     """Spawn one dlb-mcp process (= one session) bound to a shared store.
 
-    Pass session_id to set DLB_SESSION_ID (Design 1) — two processes sharing a
+    Pass session_id to set DLB_SESSION_ID (Design 1); two processes sharing a
     value simulate a crash-respawn within one harness session."""
     env = os.environ.copy()
     env["DLB_STORE"] = str(store_path)
@@ -221,7 +221,7 @@ def test_e2e_owner_recovers_but_foreign_session_is_refused(tmp_path: Path) -> No
         )
 
         # And session B genuinely cannot read alpha's inbox with a guessed/empty
-        # token — the boundary holds end to end.
+        # token; the boundary holds end to end.
         _call(a, 4, "send", {"to": "alpha", "body": "for the real owner"})
         read_b = _call(b, 5, "read", {"name": "alpha", "session_token": "not-the-token"})
         assert "_error" in read_b or read_b.get("_isError"), (
@@ -237,7 +237,7 @@ def test_new_process_same_session_id_recovers_when_holder_stale(
 ) -> None:
     # Crash-respawn: same DLB_SESSION_ID, and the prior holder is STALE (its dead
     # process stopped heartbeating). With the #4 stale-gate, recovery requires
-    # staleness — use window=0 so the just-registered holder counts as stale.
+    # staleness; use window=0 so the just-registered holder counts as stale.
     monkeypatch.setenv("DLB_TAKEOVER_AFTER_SECONDS", "0")
     monkeypatch.setenv("DLB_SESSION_ID", "S1")
     reg = server.register("alpha")
@@ -303,7 +303,7 @@ def test_e2e_crash_respawn_same_session_recovers(
 ) -> None:
     """Design 1 over the wire: process A registers `alpha` under session S1 and
     EXITS (simulating an MCP-server crash). A brand-new process with the SAME
-    DLB_SESSION_ID recovers once the (dead) holder is stale — proving recovery
+    DLB_SESSION_ID recovers once the (dead) holder is stale, proving recovery
     rests on the persisted session id, not the (now-empty) in-memory owned-set.
     A process with a DIFFERENT id is refused. (Window=0 so the dead holder is
     immediately stale; the #4 stale-gate blocks eviction of a *live* holder.)"""
@@ -314,7 +314,7 @@ def test_e2e_crash_respawn_same_session_recovers(
         reg = _call(a, 1, "register", {"name": "alpha"})
         token = reg["session_token"]
         assert token
-    # `a` has now exited — its process (and owned-set) is gone.
+    # `a` has now exited; its process (and owned-set) is gone.
 
     with _session(shared, session_id="S1") as respawn:
         rec = _call(respawn, 2, "recover_token", {"name": "alpha"})
@@ -341,7 +341,7 @@ def test_persisted_token_reclaim_after_full_restart(monkeypatch: pytest.MonkeyPa
     """The instant path for the case neither Design 1 nor 2 covers: a full
     restart where the session id rotated AND the prior holder is not yet stale.
     The returning owner reads its token from the sidecar and reclaims via
-    prior_token — which matches, so the stale-gate is bypassed."""
+    prior_token, which matches, so the stale-gate is bypassed."""
     monkeypatch.setenv("DLB_TAKEOVER_AFTER_SECONDS", "1800")  # prior holder stays "live"
     monkeypatch.setenv("DLB_SESSION_ID", "S1")
     reg = server.register("alpha")
@@ -358,8 +358,8 @@ def test_persisted_token_reclaim_after_full_restart(monkeypatch: pytest.MonkeyPa
     with pytest.raises(store.TakeoverDenied):
         server.register("alpha", force=True)
 
-    # Reclaim: read the single-use RECLAIM SECRET from the sidecar (line 2) — NOT
-    # the token — and present it. It matches reclaim_hash → instant reclaim, no
+    # Reclaim: read the single-use RECLAIM SECRET from the sidecar (line 2), NOT
+    # the token, and present it. It matches reclaim_hash → instant reclaim, no
     # stale-gate wait, and the token+secret both ROTATE.
     secret = store.sidecar_path("alpha").read_text().splitlines()[1]
     assert secret != token  # the sidecar never held the token

@@ -1,4 +1,4 @@
-"""Stage 3 red-team regressions — sidecar collision, int overflow, unicode."""
+"""Stage 3 red-team regressions: sidecar collision, int overflow, unicode."""
 
 from __future__ import annotations
 

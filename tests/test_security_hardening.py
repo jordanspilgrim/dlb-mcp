@@ -10,7 +10,7 @@ Covers:
   Issue 8   list_threads uses an IMMEDIATE (write) transaction
 
 Note on Issue 1a: the recover_token / deterministic-token behavior is
-intentionally unchanged (accepted cooperative-model tradeoff) — that fix was
+intentionally unchanged (accepted cooperative-model tradeoff). That fix was
 docstring-only, so there is no behavior regression test for it here; the
 existing test_recover_token.py already pins the behavior.
 """
@@ -83,7 +83,7 @@ def test_registered_owner_read_still_marks_read() -> None:
     store.send(to="owner", body="hello")
     first = store.read("owner", session_token=reg["session_token"])
     assert len(first) == 1
-    # Second unread-only read returns nothing — the owner path is still destructive.
+    # Second unread-only read returns nothing; the owner path is still destructive.
     second = store.read("owner", session_token=reg["session_token"])
     assert second == []
 
@@ -136,7 +136,7 @@ def test_read_registered_without_token_is_rejected() -> None:
 
 
 # ── Issue 6: atomic secret creation ──────────────────────────────────────────
-# (Removed: the per-store HMAC secret was retired when tokens became random —
+# (Removed: the per-store HMAC secret was retired when tokens became random;
 # there is no derived-token secret to create atomically anymore. See
 # test_token_identity.py for the random-token contract.)
 

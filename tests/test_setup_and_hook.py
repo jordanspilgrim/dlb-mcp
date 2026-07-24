@@ -43,7 +43,7 @@ def test_setup_is_idempotent(tmp_path):
     setup.wire_session_hook(p)
     changed, msg = setup.wire_session_hook(p)
     assert not changed and "already wired" in msg
-    # Exactly one SessionStart entry — no duplicate.
+    # Exactly one SessionStart entry, no duplicate.
     data = json.loads(p.read_text())
     assert len(data["hooks"]["SessionStart"]) == 1
 

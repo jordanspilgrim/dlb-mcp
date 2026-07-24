@@ -1,6 +1,6 @@
-"""FastMCP server exposing DLB's six tools over stdio.
+"""FastMCP server exposing DLB's ten tools over stdio.
 
-This module is a thin façade — all real logic lives in store.py. The tools
+This module is a thin façade; all real logic lives in store.py. The tools
 here exist only to:
     1. Receive MCP arguments and dispatch to store functions
     2. Convert store dataclasses to plain dicts for JSON-RPC serialization
@@ -20,13 +20,13 @@ from . import store
 mcp = FastMCP(
     name="dlb",
     instructions=(
-        "DLB — Dead Letter Box. Ten tools for inter-agent messaging + task lifecycle:\n"
+        "DLB, Dead Letter Box. Ten tools for inter-agent messaging + task lifecycle:\n"
         "  register, recover_token, set_status, list_threads, send, read, ack,\n"
         "  unregister, update_status, get_task_status.\n"
         "Liveness: call set_status(name, token, 'working'|'idle'|'blocked'|'done') "
         "as you work so list_threads shows real status, not just a last_seen guess.\n"
         "Lost your session_token to context compaction? Call recover_token(name) "
-        "to get it back — do NOT re-register (that mints a new token and trips "
+        "to get it back; do NOT re-register (that mints a new token and trips "
         "the takeover gate on your own live name).\n"
         "Send is open (no auth); pass session_token on send to bind from_ to "
         "your registered name (otherwise from_ is unverified free text). "
@@ -39,7 +39,7 @@ mcp = FastMCP(
         "registration.\n"
         "Trust boundary: session_token gates the tool API, not the underlying "
         "SQLite file. DLB is coordination between cooperating agents under the "
-        "same OS user — not confidentiality."
+        "same OS user, not confidentiality."
     ),
 )
 
@@ -72,7 +72,7 @@ def _message_dict(m: store.Message) -> dict[str, Any]:
 
     Every message historically carried five v3 lifecycle keys
     (msg_type/in_reply_to/status/status_note/status_updated_at) plus read_at,
-    even when all were null — dead weight on every read/send payload. We now
+    even when all were null, dead weight on every read/send payload. We now
     include an optional key only when it has a value, so a plain (non-task)
     message serializes to just the six core fields. Callers should treat a
     missing key as null (the prior explicit-null semantics).
@@ -106,14 +106,14 @@ def _message_dict(m: store.Message) -> dict[str, Any]:
 # ── Per-process identity ownership (Design 2: the process IS the boundary) ────
 #
 # This dlb-mcp process is spawned once per client session and lives for that
-# session's whole lifetime. Crucially it SURVIVES context compaction — compaction
+# session's whole lifetime. Crucially it SURVIVES context compaction; compaction
 # summarizes the model's context, it does not restart this OS process. So an
 # in-memory record of "which names THIS process registered" is a per-session
 # identity that outlives the very event (compaction) that loses the token from
 # the agent's context.
 #
 # recover_token uses it to hand a token back ONLY to the session that registered
-# the name. Before, recover_token returned ANY name's token to ANY caller —
+# the name. Before, recover_token returned ANY name's token to ANY caller,
 # defeating the whole session_token gate (Issue 1). Now:
 #   • same session, post-compaction  → name is owned → token returned
 #   • a different session            → different process, empty set → refused
@@ -122,12 +122,12 @@ def _message_dict(m: store.Message) -> dict[str, Any]:
 #
 # Scope, stated honestly: this gates the SANCTIONED tool-API path. An agent that
 # bypasses the tools entirely (`python -c "import dlb_mcp.store; ..."`, or reading
-# the SQLite file) can still obtain the token — but that is raw-store access,
+# the SQLite file) can still obtain the token, but that is raw-store access,
 # already out of scope under DLB's trust boundary (same as reading the DB file).
 # The point is that mcp__dlb__recover_token stops being a token dispenser.
 # name → live token, for names THIS process registered. Since the DB stores only
 # sha256(token), this in-memory map is the ONLY place a full token lives besides
-# the client that called register — and it is what recover_token returns to the
+# the client that called register, and it is what recover_token returns to the
 # same session after compaction (the process, and this map, outlive compaction).
 _owned_tokens: dict[str, str] = {}
 
@@ -159,7 +159,7 @@ def register(
 ) -> dict[str, Any]:
     """Declare or refresh an agent identity.
 
-    Returns the agent record plus a `session_token` you must keep — it's
+    Returns the agent record plus a `session_token` you must keep; it's
     required for `read`, `ack`, and `unregister` on this name.
 
     Conflict behavior:
@@ -179,13 +179,13 @@ def register(
             "worker-1".
         working_on: Free-text description of what this agent is doing.
             Shown to other agents via `list_threads`. Optional.
-        force: If True, attempt to evict the prior session. Stale-gated —
-            see conflict behavior above.
+        force: If True, attempt to evict the prior session. Stale-gated.
+            See conflict behavior above.
         prior_token: The current holder's session_token, if you have it.
             Lets a legitimate handoff bypass the stale-gate on force=True.
     """
     result = store.register(name, working_on=working_on, force=force, prior_token=prior_token)
-    # Cache the live token in process memory — the DB holds only its hash, so
+    # Cache the live token in process memory; the DB holds only its hash, so
     # this map is how recover_token hands the token back to THIS session after
     # compaction. force-reclaim also lands here, so a legitimate takeover caches
     # its fresh token too.
@@ -197,7 +197,7 @@ def register(
 def recover_token(name: str) -> dict[str, Any] | None:
     """Re-obtain the session_token for a name THIS session registered.
 
-    Use this when you've LOST your token — the common cause is context
+    Use this when you've LOST your token; the common cause is context
     compaction wiping it from your working memory mid-session. It returns the
     live token so you can resume reading your inbox. Do NOT re-register to
     recover: register mints a brand-new token and, because your old session is
@@ -210,8 +210,8 @@ def recover_token(name: str) -> dict[str, Any] | None:
          common "compaction wiped my token" case.
       2. Harness-session match (Design 1): the name was registered under the
          same DLB_SESSION_ID this process carries. This covers a NEW process in
-         the SAME session — e.g. the MCP server crashed and the harness
-         respawned it while the app stayed open — recovering without the
+         the SAME session (e.g. the MCP server crashed and the harness
+         respawned it while the app stayed open), recovering without the
          stale-gate. (A full restart / --resume rotates the session id, so that
          still falls through to force + stale-gate.)
 
@@ -220,7 +220,7 @@ def recover_token(name: str) -> dict[str, Any] | None:
     API; raw store/SQLite access is out of scope, per DLB's trust boundary.
 
     With hashed-at-rest tokens the Design 1 path MINTS a fresh token (the DB has
-    only a hash and a crash-respawned process never held the original) — safe, it
+    only a hash and a crash-respawned process never held the original): safe, it
     proved same-session and the old process is dead.
 
     Returns None if `name` was never registered anywhere. Raises if `name` is
@@ -229,7 +229,7 @@ def recover_token(name: str) -> dict[str, Any] | None:
     Args:
         name: The name you previously registered and want the token for.
     """
-    # Design 2: same process — the live token is in our memory cache.
+    # Design 2: same process. The live token is in our memory cache.
     if _owns(name):
         meta = store.agent_meta(name) or {}
         return {
@@ -242,10 +242,10 @@ def recover_token(name: str) -> dict[str, Any] | None:
     if meta is None:
         return None  # never registered anywhere
     # Design 1: same harness session (stable id across an MCP-server respawn),
-    # AND the prior holder is STALE. Both id sides must be non-None and equal —
+    # AND the prior holder is STALE. Both id sides must be non-None and equal;
     # an unset/None id never matches. The staleness gate is the security fix for
     # red-team #4: without it, a misconfigured (static) DLB_SESSION_ID shared
-    # across sessions would let any peer silently mint a token for — and EVICT —
+    # across sessions would let any peer silently mint a token for (and EVICT)
     # a LIVE holder. Design 1's real premise is a crash-respawn, where the prior
     # process is dead and thus stale; a live holder (recent last_seen) is never
     # evictable this way. A fast crash-respawn that isn't stale yet still recovers
@@ -271,7 +271,7 @@ def recover_token(name: str) -> dict[str, Any] | None:
         "live holder is not stale). recover_token returns a token only to the "
         "same process, or the same DLB_SESSION_ID once the prior holder is stale. "
         "To reclaim after a full restart, read your reclaim secret from the "
-        "sidecar and call register(force=True, prior_token=<secret>) — instant, "
+        "sidecar and call register(force=True, prior_token=<secret>), instant, "
         "no wait; if this is a different agent, pick your own name."
     )
 
@@ -286,13 +286,13 @@ def set_status(
     """Report your current liveness status so coordinators aren't guessing.
 
     Convention: status ∈ {"working", "idle", "blocked", "done"} (any string is
-    accepted). `detail` is optional free text — e.g. what you're blocked on
+    accepted). `detail` is optional free text, e.g. what you're blocked on
     (status="blocked", detail="waiting on PR #42 review"). Requires your
     session_token. Also refreshes last_seen, so reporting status doubles as a
     heartbeat: a coordinator reading list_threads can tell a quiet-but-alive
     agent (recent last_seen, status "working"/"idle") from a stopped one.
 
-    Set "done" when you finish and "blocked" the moment you stall — far more
+    Set "done" when you finish and "blocked" the moment you stall, far more
     reliable than the last_seen staleness proxy.
 
     Args:
@@ -326,7 +326,7 @@ def list_threads(
         active_within_hours: How many hours back counts as 'active' for the
             stale flag. Default 24.
         include_stale: If True, also return agents whose `last_seen` is older
-            than the window (the old default). Default False — stale agents
+            than the window (the old default). Default False: stale agents
             are omitted entirely, not just flagged.
         only_unread: If True, return only agents with unread_count > 0
             (answers "who has mail?" with a minimal payload). Default False.
@@ -370,17 +370,17 @@ def send(
     ALWAYS succeeds (subject to size cap), even if `to` is not registered
     yet. Messages queue under the name and surface when someone reads it.
 
-    Provenance (weaker than it looks — read carefully):
+    Provenance (weaker than it looks; read carefully):
     - Without session_token: from_ is whatever the caller passed (default
-      "anonymous"). Free text — unverified. The sender label could be a lie.
+      "anonymous"). Free text, unverified. The sender label could be a lie.
     - With session_token: token is looked up. If from_ is omitted, it
       becomes the token's registered name. If from_ is supplied, it MUST
       match the token's name or AuthError is raised.
     - This is NOT unforgeable provenance. No token is stored at rest, so the tool
-      API won't hand a peer X's token and a raw file read won't reveal one — the
+      API won't hand a peer X's token and a raw file read won't reveal one; the
       most a same-user peer with raw access can do is read the sidecar's
       single-use reclaim secret and hijack X once (which rotates it → detectable).
-      Treat sender_name as an attribution HINT, not proof of origin — fine under
+      Treat sender_name as an attribution HINT, not proof of origin, fine under
       DLB's cooperative same-user model, but never a trust boundary between
       distinct agents.
 
@@ -409,7 +409,7 @@ def send(
         in_reply_to: Optional id of the message this is replying to
             (for threading task-acknowledgment replies to the original task).
         headline: Optional machine-parseable one-liner surfaced UNTRUNCATED in
-            monitor/list previews — read a sender's status without opening the
+            monitor/list previews: read a sender's status without opening the
             message or holding a token. Use this instead of encoding status in
             the subject.
 
@@ -475,7 +475,7 @@ def read(
 def ack(message_id: int, session_token: str) -> dict[str, Any]:
     """Explicitly acknowledge a message ("I saw this and acted on it").
 
-    Optional — `read` already marks messages as read. Use ack to record a
+    Optional: `read` already marks messages as read. Use ack to record a
     stronger signal. v1 treats ack as "definitely read" (sets read_at if
     not already set). The read/ack distinction is reserved for future use.
 
@@ -520,7 +520,7 @@ def update_status(
     "running", "done", "blocked"}. Any string is accepted so future
     conventions can extend without a schema migration.
 
-    Side effect: sets read_at on the message if it was still unread —
+    Side effect: sets read_at on the message if it was still unread;
     updating status implies you've read it, so this replaces `ack` for
     the common case.
 
@@ -547,13 +547,13 @@ def update_status(
 def get_task_status(message_id: int) -> dict[str, Any] | None:
     """Query the lifecycle status of a message without reading its body (v0.3.0+).
 
-    NO AUTH — DLB's trust model is coordination between cooperating agents
+    NO AUTH: DLB's trust model is coordination between cooperating agents
     under the same OS user. This is the sender-side counterpart to
     `update_status`: it lets a sender check "did my task get picked up? is
     it running? is it done?" without holding the recipient's session_token.
 
     Returns None if the message id doesn't exist. Otherwise returns a
-    lightweight status dict — NOT the message body. Use `read` if you
+    lightweight status dict, NOT the message body. Use `read` if you
     need the content.
 
     Args:

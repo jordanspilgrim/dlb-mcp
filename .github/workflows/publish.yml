@@ -1,6 +1,6 @@
 name: Publish to PyPI
 
-# Trusted publishing (OIDC) — no API token stored anywhere. Triggers on a
+# Trusted publishing (OIDC): no API token stored anywhere. Triggers on a
 # version tag (e.g. v0.5.1). ONE-TIME SETUP on PyPI before the first run:
 #   pypi.org → dlb-mcp → Manage → Publishing → Add a trusted publisher:
 #     Owner: jordanspilgrim   Repo: dlb-mcp

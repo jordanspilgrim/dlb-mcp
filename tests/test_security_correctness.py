@@ -152,7 +152,7 @@ def test_v1_schema_migrates_to_v2_on_connect(isolated_store) -> None:
 
 
 def test_migration_drops_legacy_text_columns(isolated_store) -> None:
-    """After migration, the table has ONLY the *_ms columns — the legacy
+    """After migration, the table has ONLY the *_ms columns; the legacy
     TEXT columns are gone. If they were left in place with NOT NULL,
     every subsequent send/register would fail with a constraint error."""
     conn = sqlite3.connect(str(isolated_store))
@@ -300,7 +300,7 @@ def test_init_schema_is_idempotent_post_migration(isolated_store) -> None:
 
 def test_read_at_returned_matches_db_to_the_millisecond(isolated_store) -> None:
     """When read() marks messages as read, the read_at on returned objects
-    must equal the read_at_ms stored in the DB — not a second 'now' read
+    must equal the read_at_ms stored in the DB, not a second 'now' read
     a few microseconds later that lexically/numerically diverges."""
     reg = store.register("alpha")
     store.send(to="alpha", body="m", from_="x")
@@ -347,7 +347,7 @@ def test_send_counts_utf8_bytes_not_codepoints(
 ) -> None:
     """A 4-byte emoji should count as 4 toward the cap, not 1."""
     monkeypatch.setenv("DLB_MAX_BODY_BYTES", "3")
-    # 1 codepoint, 4 UTF-8 bytes — over the 3-byte cap
+    # 1 codepoint, 4 UTF-8 bytes: over the 3-byte cap
     with pytest.raises(DLBError):
         store.send(to="alpha", body="🔔", from_="me")
 
@@ -358,7 +358,7 @@ def test_send_counts_utf8_bytes_not_codepoints(
 def test_force_takeover_denied_while_holder_is_active() -> None:
     """Default DLB_TAKEOVER_AFTER_SECONDS=86400; a just-registered holder
     is well within that window, so force=True without prior_token should
-    raise TakeoverDenied — NOT silently hijack the name."""
+    raise TakeoverDenied, NOT silently hijack the name."""
     store.register("alpha")
     with pytest.raises(TakeoverDenied):
         store.register("alpha", force=True)
@@ -380,7 +380,7 @@ def test_force_takeover_allowed_when_holder_stale(
 
 def test_force_takeover_allowed_with_matching_prior_token() -> None:
     """A legitimate handoff (caller has the current token) should not
-    have to wait for the stale window — passing prior_token bypasses it."""
+    have to wait for the stale window; passing prior_token bypasses it."""
     r1 = store.register("alpha")
     r2 = store.register("alpha", force=True, prior_token=r1["session_token"])
     # Random tokens: handoff rotates to a fresh token. Property under test:
@@ -423,7 +423,7 @@ def test_send_with_token_auto_sets_from_to_registered_name() -> None:
 
 
 def test_send_with_token_rejects_mismatched_from() -> None:
-    """If you supply both, they must agree — no spoofing."""
+    """If you supply both, they must agree, no spoofing."""
     reg = store.register("alpha")
     with pytest.raises(AuthError):
         store.send(
@@ -446,7 +446,7 @@ def test_send_with_token_accepts_matching_from() -> None:
 
 
 def test_send_with_invalid_token_raises_autherror() -> None:
-    """A garbage token shouldn't silently degrade to anonymous — it's a
+    """A garbage token shouldn't silently degrade to anonymous; it's a
     caller bug worth surfacing."""
     with pytest.raises(AuthError):
         store.send(to="ghost", body="hi", session_token="bogus-token")
@@ -457,7 +457,7 @@ def test_authenticated_send_uses_a_single_connection(
 ) -> None:
     """The token lookup and message insert MUST share one SQLite connection
     (so BEGIN IMMEDIATE makes them one transaction). Prior implementation
-    used two separate _connect() contexts — a benign TOCTOU: the token
+    used two separate _connect() contexts, a benign TOCTOU: the token
     could be unregistered between lookup and insert, silently binding
     sender_name to a just-departed name.
 
@@ -485,11 +485,11 @@ def test_authenticated_send_uses_a_single_connection(
 
     msg = store.send(to="ghost", body="atomic", session_token=reg["session_token"])
     assert msg.sender_name == "alpha"
-    # Exactly one _connect() call — the lookup and insert are on the same
+    # Exactly one _connect() call: the lookup and insert are on the same
     # connection inside one BEGIN IMMEDIATE transaction.
     assert call_count["n"] == 1, (
         f"authenticated send opened {call_count['n']} connections; expected 1 "
-        "(regression — the token lookup and insert are no longer atomic)"
+        "(regression: the token lookup and insert are no longer atomic)"
     )
 
 

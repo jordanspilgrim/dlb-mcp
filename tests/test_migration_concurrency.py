@@ -1,4 +1,4 @@
-"""Stage 1 regressions — atomic, locked, self-healing init_schema.
+"""Stage 1 regressions: atomic, locked, self-healing init_schema.
 
 Covers the red-team migration/concurrency findings:
   #2  concurrent init_schema no longer throws raw sqlite errors
@@ -70,7 +70,7 @@ def _mig_worker(store_path: str, idx: int, barrier, q) -> None:
         s.register(f"racer{idx}")
         s.list_threads()
         q.put(("ok", None))
-    except Exception as e:  # noqa: BLE001 — we want to report ANY escape
+    except Exception as e:  # noqa: BLE001 (we want to report ANY escape)
         q.put(("err", f"{type(e).__name__}: {e}"))
 
 
@@ -96,7 +96,7 @@ def test_concurrent_init_schema_has_no_unhandled_errors(tmp_path: Path) -> None:
 
 
 def test_crashed_fresh_init_self_heals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Modern (v7) tables stamped user_version=0 — the state a crash between
+    """Modern (v7) tables stamped user_version=0, the state a crash between
     _create_current_schema and the version stamp used to leave. Must self-heal
     to the current version and be usable, NOT brick as a mis-detected v1 DB."""
     dbp = tmp_path / "store.sqlite3"
@@ -162,7 +162,7 @@ def test_concurrent_upgrade_to_newer_raises_forward_compat(
 ) -> None:
     """Codex #2: if a NEWER dlb-mcp bumps the store past SCHEMA_VERSION while our
     init_schema is blocked on BEGIN IMMEDIATE, the re-read under the lock must
-    raise the forward-compat DLBError — not treat > SCHEMA_VERSION as success.
+    raise the forward-compat DLBError, not treat > SCHEMA_VERSION as success.
 
     A holder thread grabs the write lock and (uncommitted) bumps user_version to
     SCHEMA_VERSION+1, then holds briefly. Our init_schema reads the OLD committed

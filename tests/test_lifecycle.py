@@ -93,7 +93,7 @@ def test_update_status_by_recipient_records_state() -> None:
 
 
 def test_update_status_sets_read_at_if_still_unread() -> None:
-    """A status update implies the recipient has read the message —
+    """A status update implies the recipient has read the message,
     replaces `ack` for the common case."""
     reg = store.register("alpha")
     task = store.send(to="alpha", body="task", from_="qa", msg_type="task")
@@ -147,7 +147,7 @@ def test_update_status_rejects_wrong_token() -> None:
 
 
 def test_update_status_rejects_unregistered_recipient() -> None:
-    """Cannot update status when the recipient is unregistered — nobody
+    """Cannot update status when the recipient is unregistered: nobody
     to authenticate as."""
     task = store.send(to="ghost", body="do X", from_="qa", msg_type="task")
     with pytest.raises(AuthError):
@@ -228,7 +228,7 @@ def test_get_task_status_returns_none_for_unknown_id() -> None:
 
 
 def test_get_task_status_does_not_return_body() -> None:
-    """Status probe is lightweight — no body/subject. Callers use `read`
+    """Status probe is lightweight: no body/subject. Callers use `read`
     if they want content."""
     task = store.send(to="alpha", body="secret plan", from_="qa", msg_type="task")
     status = store.get_task_status(task.id)
@@ -436,7 +436,7 @@ def test_full_task_lifecycle_round_trip() -> None:
     # 5. Recipient completes
     store.send(
         to="orchestrator",
-        body="done — 0 high, 2 medium findings; see PR #42",
+        body="done: 0 high, 2 medium findings; see PR #42",
         from_="worker",
         session_token=reg_recipient["session_token"],
         in_reply_to=task.id,
