@@ -125,9 +125,11 @@ get_task_status(task.id)
 
 If you need any of those, you want a full task-orchestration layer, not more features on DLB.
 
-## Push-like wake: `dlb-monitor` plus Claude Code's Monitor tool
+## Push-like wake
 
-DLB is polling-only by design (request-response MCP, no push). But Claude Code has a `Monitor` tool that streams stdout from a long-running process into the conversation as notifications; each line wakes the agent mid-idle. `dlb-monitor` is a tiny CLI that polls the store and emits one line per new message, built to be wrapped by `Monitor`:
+DLB is polling-only by design (request-response MCP, no push), and an idle agent CLI just sits waiting on stdin, so a message can land in an inbox nobody is watching. Two small companion tools close that gap; pick by your surface.
+
+**Claude Code:** `dlb-monitor` plus Claude Code's built-in `Monitor` tool. `dlb-monitor` is a tiny CLI that polls the store and emits one stdout line per new message; `Monitor` streams each line into the conversation as a notification that wakes the agent mid-idle:
 
 ```python
 # Run at session start (or have the agent call it after registering):
@@ -152,15 +154,19 @@ dlb-monitor --name alpha --exclude-senders bot,system     # denylist
 dlb-monitor --name alpha --interval 1                     # tick frequency (default 2s)
 ```
 
-**When `dlb-monitor` is the right answer vs. [`dlb-launcher`](https://github.com/jordanspilgrim/dlb-launcher):**
+**Codex CLI, Gemini CLI (and Claude Code too):** [`dlb-launcher`](https://github.com/jordanspilgrim/dlb-launcher), a tiny PTY wrapper. It owns the wrapped CLI's terminal, watches the store for mail addressed to this session, and injects a synthetic wake prompt into the child's stdin when a message arrives and the CLI is idle. The mechanism is OS-level, so it is the same regardless of which model is behind the CLI, which makes it the wake path for any tool without a native Monitor equivalent:
 
-| Surface | Use |
+```bash
+uvx dlb-launcher --name alpha claude      # or codex, or gemini
+```
+
+| Surface | Wake source |
 |---|---|
-| Claude Code (terminal or app) | `dlb-monitor` via Monitor tool: native notification path, no PTY mechanics |
-| Codex CLI / Gemini CLI | `dlb-launcher` PTY wrap: Monitor tool doesn't exist there, so PTY injection is the only path |
+| Claude Code (terminal or app) | `dlb-monitor` via the Monitor tool: native notification path, no PTY mechanics |
+| Codex CLI / Gemini CLI | `dlb-launcher` PTY wrap: no Monitor tool there, so PTY injection is the path |
 | Web (claude.ai) | Neither; call `read` manually per turn |
 
-They're complementary, not competitive.
+The two are complementary: `dlb-monitor` is the cleanest fit for Claude Code, `dlb-launcher` covers anything you can wrap in a PTY.
 
 ## Configuration
 
