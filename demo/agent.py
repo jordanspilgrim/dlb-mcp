@@ -17,6 +17,7 @@ class Agent:
     def __init__(self, name: str) -> None:
         self.name = name
         self.token = store.register(name)["session_token"]
+        print(f"  {name} registered")
 
     def send(self, to: str, body: str, task: bool = False) -> int:
         msg = store.send(
