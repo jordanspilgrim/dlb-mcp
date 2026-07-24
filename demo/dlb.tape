@@ -19,7 +19,7 @@ Set Theme "Dracula"
 
 # --- hidden setup: scratch store, venv, land in the demo dir ---
 Hide
-Type "bash demo/reset.sh >/dev/null 2>&1 && source .venv/bin/activate && cd demo && export DLB_STORE=/tmp/dlb-demo.sqlite3 && clear" Enter
+Type "bash demo/reset.sh >/dev/null 2>&1 && source .venv/bin/activate && cd demo && export DLB_STORE=/tmp/dlb-demo/store.sqlite3 && clear" Enter
 Type "python -i -c 'from agent import Agent, task_status'" Enter
 Sleep 600ms
 Show
