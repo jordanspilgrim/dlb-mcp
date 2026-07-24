@@ -1,4 +1,4 @@
-"""#3 agent liveness — self-reported status surfaced in list_threads."""
+"""#3 agent liveness: self-reported status surfaced in list_threads."""
 
 from __future__ import annotations
 

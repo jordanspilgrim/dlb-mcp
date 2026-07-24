@@ -10,7 +10,7 @@ What's covered here that isolated unit tests can't cover:
     * Real subprocess-to-subprocess coordination via the shared SQLite
       file (WAL mode, no daemon, cross-process visibility).
     * The MCP transport (stdio JSON-RPC + FastMCP tool dispatch).
-    * The session_token-bound `from_` on `send` — proves an
+    * The session_token-bound `from_` on `send`, proves an
       authenticated write in one process is trusted by a read in another.
     * `dlb-monitor` actually emits stdout lines when new mail arrives.
       Without this test, the only proof that Monitor-wrapped monitor
@@ -19,7 +19,7 @@ What's covered here that isolated unit tests can't cover:
 What's NOT covered (out of scope):
     * The Claude Code `Monitor` tool wrapper itself (that's Claude's code,
       not ours; we only need to prove `dlb-monitor` produces stdout events).
-    * PTY-based launcher wake — belongs in dlb-launcher's test suite.
+    * PTY-based launcher wake, belongs in dlb-launcher's test suite.
 """
 
 from __future__ import annotations
@@ -235,7 +235,7 @@ def test_send_from_third_party_reaches_registered_inbox(tmp_path: Path) -> None:
         )
         assert len(inbox) == 1
         assert inbox[0]["body"] == "hi"
-        # Unauthenticated from_ is a free-text label — preserved as-is
+        # Unauthenticated from_ is a free-text label, preserved as-is
         assert inbox[0]["sender_name"] == "eve"
 
 
@@ -307,11 +307,11 @@ def test_dlb_monitor_emits_wake_line_on_new_message(tmp_path: Path) -> None:
                 {"to": "alpha", "body": "wake up alpha", "from_": "bravo"},
             )
 
-        # 4. Read from monitor's stdout — must see the wake line within
+        # 4. Read from monitor's stdout, must see the wake line within
         #    a few seconds. Poll interval is 200ms; typical latency <500ms.
         assert monitor.stdout is not None
         line = _read_line_with_timeout(monitor.stdout, timeout_s=5.0)
-        assert line is not None, "dlb-monitor produced no stdout — wake did not fire"
+        assert line is not None, "dlb-monitor produced no stdout; wake did not fire"
         # Sender + body preview appear in the format we defined
         assert "bravo" in line, f"expected sender 'bravo' in wake line, got: {line!r}"
         assert "wake up alpha" in line, (
@@ -338,7 +338,7 @@ def test_dlb_monitor_ignores_pre_existing_messages(tmp_path: Path) -> None:
         assert alpha["session_token"]
         _call(srv, 2, "send", {"to": "alpha", "body": "pre-existing message"})
 
-    # 2. Start dlb-monitor — it must NOT emit anything for the pre-existing
+    # 2. Start dlb-monitor; it must NOT emit anything for the pre-existing
     monitor = subprocess.Popen(
         [
             sys.executable,
@@ -358,7 +358,7 @@ def test_dlb_monitor_ignores_pre_existing_messages(tmp_path: Path) -> None:
     )
     try:
         assert monitor.stdout is not None
-        # Wait longer than several poll intervals — should still be silent
+        # Wait longer than several poll intervals, should still be silent
         line = _read_line_with_timeout(monitor.stdout, timeout_s=1.5)
         assert line is None, (
             f"dlb-monitor emitted a wake for pre-existing mail (should ignore): {line!r}"
@@ -377,7 +377,7 @@ def test_dlb_monitor_ignores_pre_existing_messages(tmp_path: Path) -> None:
 def test_end_to_end_two_sessions_with_monitor_wake(tmp_path: Path) -> None:
     """The full picture: two MCP sessions, one has a Monitor watching its
     own inbox, mail sent by the other triggers the wake. This is the
-    documented reason DLB + dlb-monitor exists — validating it end-to-end
+    documented reason DLB + dlb-monitor exists; validating it end-to-end
     prevents regressions from silently breaking the primary use case."""
     env = os.environ.copy()
     env["DLB_STORE"] = str(tmp_path / "shared.sqlite3")

@@ -107,12 +107,12 @@ class _RunningMonitor:
     History: this helper used to spawn `run()` on a `daemon=True` thread and
     deliberately never stop it ("we live with leaving it as a daemon"),
     because `run()` had no clean shutdown signal. That leaked an unbounded
-    poll loop across tests — and because `run()` reads the *module-global*
+    poll loop across tests, and because `run()` reads the *module-global*
     `monitor._poll_iteration` and `monitor.time.sleep` each tick, a later
     test that monkeypatched those globals (test_run_loop_survives_...) had
     its shared state corrupted by the leaked loop, producing a real
     cross-test flake. `run()` now takes a `stop_event`, so the thread stops
-    cooperatively and is *joined* on context exit — no leak, no flake.
+    cooperatively and is *joined* on context exit, no leak, no flake.
     """
 
     def __init__(
@@ -173,8 +173,8 @@ class _RunningMonitor:
 
 def test_monitor_emits_one_line_per_new_message(isolated_store: Path) -> None:
     store.register("alpha")
-    # Pre-existing message — baseline must skip it
-    store.send(to="alpha", body="pre-existing — skip me", from_="x")
+    # Pre-existing message: baseline must skip it
+    store.send(to="alpha", body="pre-existing, skip me", from_="x")
 
     with _RunningMonitor("alpha", interval=0.02) as mon:
         # Baseline established (see __enter__); now inject two new messages.
@@ -185,7 +185,7 @@ def test_monitor_emits_one_line_per_new_message(isolated_store: Path) -> None:
             f"monitor did not emit both events; got: {mon.out!r}"
         )
 
-    # One stdout line per NEW message — this is what the monitor's whole
+    # One stdout line per NEW message. This is what the monitor's whole
     # contract is: exactly one Monitor wake event per arriving message.
     lines = [ln for ln in mon.out.splitlines() if ln.strip()]
     assert len(lines) == 2, f"expected 2 event lines, got {lines!r}"
@@ -197,7 +197,7 @@ def test_monitor_emits_one_line_per_new_message(isolated_store: Path) -> None:
     # Belt-and-suspenders: the store-level view agrees (pre-existing excluded).
     new = monitor._fetch_new(isolated_store, "alpha", 1)
     assert len(new) == 2
-    assert "pre-existing — skip me" not in {
+    assert "pre-existing, skip me" not in {
         body for _id, _sent, _sender, _subject, body, _hl, _mt in new
     }
 
@@ -231,14 +231,14 @@ def test_monitor_continues_after_sqlite_hiccup(
     isolated_store: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """If the SQLite store transiently fails to open, _fetch_new must return
-    [] and log to stderr — NOT raise. (The Monitor tool would stop and we'd
+    [] and log to stderr, NOT raise. (The Monitor tool would stop and we'd
     lose the wake source until manual restart.)"""
 
     def boom(*_args: object, **_kwargs: object) -> sqlite3.Connection:
         raise sqlite3.OperationalError("simulated boom")
 
     monkeypatch.setattr(sqlite3, "connect", boom)
-    # Still safe — must return [], not raise
+    # Still safe: must return [], not raise
     result = monitor._fetch_new(isolated_store, "alpha", 0)
     assert result == []
 
@@ -304,7 +304,7 @@ def test_run_loop_survives_unexpected_exception_in_poll_iteration(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The whole point of v0.2.1. A RuntimeError out of _poll_iteration
-    must NOT kill the loop — must log, back off, and continue. We force
+    must NOT kill the loop; must log, back off, and continue. We force
     one failing iteration then a normal one then a KeyboardInterrupt to
     exit cleanly, and assert the loop reached the third call (proving it
     didn't die on the RuntimeError)."""
@@ -353,7 +353,7 @@ def test_run_loop_propagates_keyboard_interrupt_cleanly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The outer except RuntimeError handler must NOT swallow
-    KeyboardInterrupt — Ctrl-C should still exit the process cleanly."""
+    KeyboardInterrupt; Ctrl-C should still exit the process cleanly."""
     store.register("alpha")
 
     def immediate_ctrl_c(*_args, **_kwargs) -> int:

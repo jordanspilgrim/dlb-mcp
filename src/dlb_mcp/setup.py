@@ -1,4 +1,4 @@
-"""``dlb-mcp setup`` — wire the SessionStart recovery hook into Claude Code.
+"""``dlb-mcp setup``: wire the SessionStart recovery hook into Claude Code.
 
 Idempotently adds a SessionStart hook running ``dlb-session-recover`` to the
 user's ``~/.claude/settings.json`` (global / machine-wide). Design rules:
@@ -59,7 +59,7 @@ def wire_session_hook(path: Path | None = None) -> tuple[bool, str]:
         settings = {}
 
     if _has_hook(settings):
-        return False, f"ok: SessionStart hook already wired in {p} — nothing to do."
+        return False, f"ok: SessionStart hook already wired in {p}, nothing to do."
 
     hooks = settings.setdefault("hooks", {})
     if not isinstance(hooks, dict):

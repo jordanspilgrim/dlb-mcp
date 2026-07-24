@@ -1,4 +1,4 @@
-"""dlb-monitor — push-like wake source for the Claude Code Monitor tool.
+"""dlb-monitor: push-like wake source for the Claude Code Monitor tool.
 
 Polls the DLB SQLite store and emits one stdout line per NEW message
 (newest first within a poll tick). Each line is in turn delivered to
@@ -17,11 +17,11 @@ Usage from inside Claude Code:
 Output format (one event per line, line-buffered so each is delivered
 immediately):
 
-    2026-06-30T21:30:14Z bravo: "ping — can you look at the reskin route?"
+    2026-06-30T21:30:14Z bravo: "ping, can you look at the reskin route?"
 
 The watermark is taken from MAX(messages.id) for the target recipient
 at startup, so pre-existing mail is intentionally not re-surfaced (that
-is the SessionStart hook's responsibility — re-surfacing here would
+is the SessionStart hook's responsibility; re-surfacing here would
 double-notify on every relaunch).
 
 Filters:
@@ -31,8 +31,8 @@ Filters:
                                  exclusive)
 
 Process model: pure poller. Exits on Ctrl-C (Monitor stops it cleanly
-on session end). All errors are logged to stderr and the loop continues
-— a single SQLite hiccup must not kill the wake source.
+on session end). All errors are logged to stderr and the loop continues;
+a single SQLite hiccup must not kill the wake source.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ DEFAULT_INTERVAL_SECONDS = 2.0
 DEFAULT_BODY_PREVIEW_LEN = 80
 # How long to back off after an unexpected (non-sqlite, non-KeyboardInterrupt)
 # error in the poll loop. We can't distinguish "transient I/O hiccup" from
-# "broken environment", so the backoff is a balance — long enough to avoid a
+# "broken environment", so the backoff is a balance: long enough to avoid a
 # tight crashloop, short enough that the user notices things are wrong within
 # a reasonable window.
 LOOP_ERROR_BACKOFF_SECONDS = 5.0
@@ -61,7 +61,7 @@ LOOP_ERROR_BACKOFF_SECONDS = 5.0
 
 # Any C0 control char (incl. newline, CR, tab) or DEL. Each stdout line the
 # monitor prints is a distinct Monitor wake event, so a control char in ANY
-# interpolated field — most dangerously the sender label — could forge extra
+# interpolated field (most dangerously the sender label) could forge extra
 # events or corrupt the line. store.py now rejects these at write time, but the
 # monitor reads raw SQLite (and may see legacy pre-fix rows), so it sanitizes
 # again at the sink. Defense in depth: never trust the stored value here.
@@ -84,12 +84,12 @@ def _format_event(
 ) -> str:
     """One-line, line-buffered event format.
 
-    The leading ISO timestamp + space is a deliberate readability concession
-    — Claude Code's Monitor shows the line verbatim in the notification,
+    The leading ISO timestamp + space is a deliberate readability concession;
+    Claude Code's Monitor shows the line verbatim in the notification,
     and a date prefix makes it obvious when the wake fired.
 
     If the sender set a `headline`, it is shown UNTRUNCATED (that is the whole
-    point of the field — a machine-parseable status you can read without
+    point of the field: a machine-parseable status you can read without
     opening the message). Otherwise we fall back to a truncated subject/body
     snippet.
 
@@ -137,7 +137,7 @@ def _fetch_new(
     message in `recipient`'s inbox with id > since_id, oldest first so events
     fire in arrival order. Empty list on error (logged, loop continues).
 
-    `headline` is selected tolerantly — a pre-v4 store without the column
+    `headline` is selected tolerantly; a pre-v4 store without the column
     falls back to None rather than erroring. `msg_type` (present since v0.3.0)
     lets the caller suppress auto-generated receipt acks."""
     if not db_path.exists():
@@ -185,14 +185,14 @@ def _poll_iteration(
         filtered = (
             (include_senders is not None and sender not in include_senders)
             or (exclude_senders is not None and sender in exclude_senders)
-            # Auto-generated read-receipts are machine acks — don't wake a turn
+            # Auto-generated read-receipts are machine acks; don't wake a turn
             # for them by default. They still sit in the inbox to be read.
             or (msg_type == "receipt" and not emit_receipts)
         )
         if not filtered:
             line = _format_event(sent_ms, sender, subject, body, headline=headline)
             print(line, flush=True)
-        # Always advance watermark — filtered messages still happened.
+        # Always advance watermark; filtered messages still happened.
         seen_max_id = max(seen_max_id, msg_id)
     return seen_max_id
 
@@ -209,8 +209,8 @@ def run(
 
     Resilience contract: the loop MUST NOT die on a transient error.
     `_fetch_new` already swallows `sqlite3.Error` and returns []. This
-    outer try/except catches anything else — OSError on stdout, encoding
-    bugs, memory blips, third-party-side weirdness — logs it to stderr,
+    outer try/except catches anything else (OSError on stdout, encoding
+    bugs, memory blips, third-party-side weirdness), logs it to stderr,
     backs off, and resumes. The only paths out are KeyboardInterrupt
     (Ctrl-C → exit 0) and a real process-kill (SIGKILL → uncatchable; the
     Monitor tool reports the exit code so the LLM can re-launch).
@@ -220,12 +220,12 @@ def run(
     interruptible (`Event.wait` instead of `time.sleep`), so a caller that
     embeds the monitor in a thread can stop AND join it deterministically
     instead of leaking an unkillable daemon. `main()` (the CLI path) passes
-    no event, so the default behavior — infinite loop until Ctrl-C/SIGKILL —
+    no event, so the default behavior (infinite loop until Ctrl-C/SIGKILL)
     is unchanged.
     """
     db_path = store.store_path()
     # init_schema runs migration on a legacy v1 DB so we can read *_ms
-    # safely. Safe to call here — it's idempotent.
+    # safely. Safe to call here; it's idempotent.
     try:
         store.init_schema()
     except Exception as e:
@@ -268,7 +268,7 @@ def run(
                 # Hard guarantee: a non-fatal error in one iteration must not
                 # take down the wake source. Log loud enough that the user
                 # notices (this stderr line goes to the Monitor task's
-                # output file but NOT to the conversation as a notification —
+                # output file but NOT to the conversation as a notification,
                 # which is the right asymmetry: we want the loop to keep
                 # running silently in normal failure, not to spam every
                 # transient hiccup into the LLM's context).

@@ -12,7 +12,7 @@ import sys
 from .server import serve_stdio
 
 _HELP = (
-    "dlb-mcp — Dead Letter Box MCP server (stdio transport).\n"
+    "dlb-mcp: Dead Letter Box MCP server (stdio transport).\n"
     "\n"
     "Usage:\n"
     "  dlb-mcp            Run the MCP server (speaks MCP over stdin/stdout).\n"

@@ -1,4 +1,4 @@
-"""Token identity — random, rotating, hashed at rest (replaces the old
+"""Token identity: random, rotating, hashed at rest (replaces the old
 deterministic-token scheme). Recovery no longer relies on re-derivation; it
 rests on per-process ownership / session-id / the reclaim credential.
 """
