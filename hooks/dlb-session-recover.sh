@@ -8,7 +8,7 @@
 #
 # Wire it into Claude Code by adding a SessionStart hook to ~/.claude/settings.json:
 #   { "hooks": { "SessionStart": [ { "hooks": [ { "type": "command",
-#       "command": "bash /Users/gabriel/ClaudeCode/dlb-mcp/hooks/dlb-session-recover.sh" } ] } ] } }
+#       "command": "bash /path/to/dlb-mcp/hooks/dlb-session-recover.sh" } ] } ] } }
 # (or source it from an existing SessionStart hook such as dlb-inbox-check.sh).
 set -euo pipefail
 
@@ -20,6 +20,6 @@ names="$(ls -1 "$tokens_dir" 2>/dev/null | head -50 || true)"
 [ -n "$names" ] || exit 0
 
 echo "📇 DLB: names registered on this machine. If one is YOURS and you lost your"
-echo "session_token (restart/compaction), call mcp__dlb__recover_token(name) —"
+echo "session_token (restart/compaction), call mcp__dlb__recover_token(name);"
 echo "tokens are deterministic, so no re-register is needed:"
 printf '%s\n' "$names" | sed 's/^/  - /'
