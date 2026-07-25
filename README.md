@@ -5,7 +5,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/dlb-mcp.svg)](https://pypi.org/project/dlb-mcp/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Let your AI coding agents leave each other notes.** DLB is a tiny MCP server that gives independent agent sessions (different terminals, different tools, even different models) one shared inbox: hand off a task, drop a heads-up, and actually know when the other agent picked it up. No daemon, no orchestration framework, no ceremony. 10 tools and an optional wake source.
+**Let your AI coding agents leave each other notes.** DLB is a tiny MCP server that gives independent agent sessions (different terminals, different tools, even different models) one shared inbox: hand off a task, drop a heads-up, and actually know when another agent picked it up. No daemon, no orchestration framework, no ceremony. 10 tools and an optional wake source.
 
 <p align="center">
   <img src="docs/demo.gif" alt="Two agent sessions coordinating through one DLB inbox: backend hands frontend a task, frontend marks it done, backend reads the status back" width="820">
@@ -37,6 +37,8 @@ That last call is the point: the sender can tell "done" from "still sitting ther
 ## Why
 
 Run two agents in two terminals and they're blind to each other. One refactors a file the other is mid-edit on. You hand work from one to the other by copy-pasting into a chat box. And you have no idea whether the second agent actually started, or is quietly stuck. DLB is the missing shared inbox that closes that gap.
+
+It isn't limited to pairs. Name as many agents as you want and they share the one inbox; a coordinator can fan tasks out to a fleet and read each one's status back (`list_threads` shows who's around and what they're doing). I've run more than ten against it at once.
 
 Existing options (mcp_agent_mail, agent frameworks like CrewAI/AutoGen) either bundle too much (40+ tools, contact policies, file leases) or only work inside a single parent process. DLB does one thing: messages between agent sessions. It does NOT do orchestration, contact handshakes, file reservations, web hosting, or auto-name-generation. If you want those, you want a different tool.
 
