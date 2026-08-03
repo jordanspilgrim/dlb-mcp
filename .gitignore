@@ -29,3 +29,11 @@ Thumbs.db
 store.sqlite3
 store.sqlite3-wal
 store.sqlite3-shm
+
+# secrets (added during public-prep)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
