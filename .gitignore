@@ -37,3 +37,11 @@ store.sqlite3-shm
 *.pem
 *.key
 credentials.json
+
+# Working plans (never committed)
+.claude/plans/
+
+# Agent harness — per-session/per-machine state (the descriptor + settings ARE committed)
+.claude/.dlb-role
+.claude/worktrees/
+.claude/.branch-switch-allow

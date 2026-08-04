@@ -215,6 +215,21 @@ Stores migrate forward automatically on first connect.
 
 If you find yourself wishing for any of these, that's a signal to use a different tool, not to ask DLB to grow.
 
+## Developing DLB
+
+```bash
+uv venv && uv sync
+uv run ruff check . && uv run ruff format --check .   # lint + format gate
+uv run pytest -q                                       # 189 tests, ~9s
+```
+
+Tests use a throwaway store via `tmp_path`. Never point a test or a manual run at `~/.dlb` — that
+is the live coordination bus for whatever agent sessions are running on your machine.
+
+Working on DLB with Claude Code? Run `./scripts/harness-bootstrap.sh` once to install the shared
+agent harness into `~/.claude` (roster, `/kickoff`, `/standup`, DLB and branch-isolation hooks).
+The per-project descriptor is committed at [.claude/project.md](.claude/project.md).
+
 ## Author
 
 Built by [Gabriel Giordani](https://github.com/jordanspilgrim). Issues and pull requests welcome.
