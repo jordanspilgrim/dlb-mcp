@@ -166,6 +166,21 @@ def _fetch_new(
         return []
 
 
+# How often the monitor tells the store "a live wake source is watching this
+# inbox". Must stay well under store.wake_window_seconds() (default 120s) so a
+# healthy monitor never reads as stale between beats.
+HEARTBEAT_INTERVAL_SECONDS = 30.0
+
+
+def _heartbeat(name: str) -> None:
+    """Record a monitor heartbeat. Never raises: a failed beat only means
+    senders briefly see `wakeable=False`, which must not kill the wake source."""
+    try:
+        store.record_monitor_heartbeat(name)
+    except Exception as e:
+        print(f"dlb-monitor: warning: heartbeat failed: {e}", file=sys.stderr)
+
+
 def _poll_iteration(
     db_path: Path,
     name: str,
@@ -249,9 +264,14 @@ def run(
         time.sleep(seconds)
         return False
 
+    last_beat = float("-inf")
     try:
         while stop_event is None or not stop_event.is_set():
             try:
+                now = time.monotonic()
+                if now - last_beat >= HEARTBEAT_INTERVAL_SECONDS:
+                    _heartbeat(name)
+                    last_beat = now
                 seen_max_id = _poll_iteration(
                     db_path,
                     name,

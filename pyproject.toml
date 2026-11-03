@@ -1,7 +1,7 @@
 [project]
 name = "dlb-mcp"
 version = "0.6.5"
-description = "Dead Letter Box: a tiny MCP server for independent agent sessions to leave each other notes. Ten tools, no daemon, real dead-letter semantics + task lifecycle. Includes dlb-monitor for push-like wake via Claude Code's Monitor tool."
+description = "Dead Letter Box: a tiny MCP server for independent agent sessions to leave each other notes. Fifteen tools, no daemon, real dead-letter semantics + task lifecycle. Includes dlb-monitor for push-like wake via Claude Code's Monitor tool."
 readme = "README.md"
 authors = [{ name = "Gabriel Giordani" }]
 license = { text = "MIT" }
@@ -19,6 +19,7 @@ Issues = "https://github.com/jordanspilgrim/dlb-mcp/issues"
 dlb-mcp = "dlb_mcp.__main__:main"
 dlb-monitor = "dlb_mcp.monitor:main"
 dlb-session-recover = "dlb_mcp.recover_hook:main"
+dlb-inbox-check = "dlb_mcp.inbox_hook:main"
 
 [build-system]
 requires = ["hatchling"]

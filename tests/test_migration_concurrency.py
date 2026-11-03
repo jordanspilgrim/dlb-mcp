@@ -112,6 +112,38 @@ def test_crashed_fresh_init_self_heals(tmp_path: Path, monkeypatch: pytest.Monke
     assert store.read("alpha", session_token=reg["session_token"]) == []
 
 
+def test_v8_store_migrates_to_v9(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A v8 store (no claims table, no v9 columns) upgrades in place, keeps its
+    rows, and supports the v9 features afterwards."""
+    dbp = tmp_path / "store.sqlite3"
+    monkeypatch.setenv("DLB_STORE", str(dbp))
+    store.init_schema()
+    tok = store.register("alpha")["session_token"]
+    old = store.send("alpha", "pre-upgrade")
+    with sqlite3.connect(str(dbp)) as c:
+        c.execute("DROP TABLE claims")
+        for col in ("cancelled_at_ms", "cancel_reason", "superseded_by", "deadline_ms"):
+            c.execute(f"ALTER TABLE messages DROP COLUMN {col}")
+        for col in ("monitor_heartbeat_ms", "receipts_opt_out"):
+            c.execute(f"ALTER TABLE agents DROP COLUMN {col}")
+        c.execute("PRAGMA user_version = 8")
+
+    store.init_schema()
+    with sqlite3.connect(str(dbp)) as c:
+        assert c.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
+        msg_cols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
+        agent_cols = {r[1] for r in c.execute("PRAGMA table_info(agents)")}
+        assert {"cancelled_at_ms", "cancel_reason", "superseded_by", "deadline_ms"} <= msg_cols
+        assert {"monitor_heartbeat_ms", "receipts_opt_out"} <= agent_cols
+        assert c.execute("SELECT name FROM sqlite_master WHERE name='claims'").fetchone()
+
+    assert [m.id for m in store.read("alpha", tok)] == [old.id]
+    assert store.claim("k", "alpha", tok)["claimed"] is True
+    assert store.record_monitor_heartbeat("alpha") is True
+    # Re-running on an already-current store is a no-op.
+    store.init_schema()
+
+
 def test_store_newer_than_code_raises_clear_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

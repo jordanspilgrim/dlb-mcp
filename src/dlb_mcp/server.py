@@ -1,4 +1,4 @@
-"""FastMCP server exposing DLB's ten tools over stdio.
+"""FastMCP server exposing DLB's fifteen tools over stdio.
 
 This module is a thin façade; all real logic lives in store.py. The tools
 here exist only to:
@@ -20,9 +20,17 @@ from . import store
 mcp = FastMCP(
     name="dlb",
     instructions=(
-        "DLB, Dead Letter Box. Ten tools for inter-agent messaging + task lifecycle:\n"
+        "DLB, Dead Letter Box. Fifteen tools for inter-agent messaging + task lifecycle:\n"
         "  register, recover_token, set_status, list_threads, send, read, ack,\n"
-        "  unregister, update_status, get_task_status.\n"
+        "  unregister, update_status, get_task_status, cancel_task, claim,\n"
+        "  release, list_claims, set_receipts.\n"
+        "Delivery: send returns `delivery` saying whether the recipient is "
+        "registered and wakeable (a live dlb-monitor). wakeable=False means an "
+        "idle session will NOT see it until its next prompt; act on the warning.\n"
+        "Withdraw work you sent with cancel_task, or replace it with "
+        "send(supersedes=<id>); bound it with send(expires_in_seconds=...).\n"
+        "Before taking shared work, claim(key) it: exactly one caller wins, so "
+        "two agents never start the same task. release(key) when done.\n"
         "Liveness: call set_status(name, token, 'working'|'idle'|'blocked'|'done') "
         "as you work so list_threads shows real status, not just a last_seen guess.\n"
         "Lost your session_token to context compaction? Call recover_token(name) "
@@ -64,6 +72,11 @@ def _agent_summary_dict(
         d["status"] = s.status
     if s.status_detail is not None:
         d["status_detail"] = s.status_detail
+    d["wakeable"] = s.wakeable
+    if s.monitor_heartbeat is not None:
+        d["monitor_heartbeat"] = s.monitor_heartbeat.isoformat()
+    if s.unread_receipts:
+        d["unread_receipts"] = s.unread_receipts
     return d
 
 
@@ -100,6 +113,17 @@ def _message_dict(m: store.Message) -> dict[str, Any]:
         d["status_note"] = m.status_note
     if m.status_updated_at is not None:
         d["status_updated_at"] = m.status_updated_at.isoformat()
+    if m.deadline is not None:
+        d["deadline"] = m.deadline.isoformat()
+    if m.cancelled_at is not None:
+        d["cancelled_at"] = m.cancelled_at.isoformat()
+    if m.cancel_reason is not None:
+        d["cancel_reason"] = m.cancel_reason
+    if m.superseded_by is not None:
+        d["superseded_by"] = m.superseded_by
+    lifecycle = m.lifecycle
+    if lifecycle is not None:
+        d["lifecycle"] = lifecycle
     return d
 
 
@@ -364,6 +388,8 @@ def send(
     in_reply_to: int | None = None,
     headline: str | None = None,
     content: str | None = None,
+    supersedes: int | None = None,
+    expires_in_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Drop a message into `to`'s inbox.
 
@@ -412,6 +438,19 @@ def send(
             monitor/list previews: read a sender's status without opening the
             message or holding a token. Use this instead of encoding status in
             the subject.
+        supersedes: Optional id of an earlier message YOU sent (requires
+            session_token) that this one replaces. The old one is hidden from
+            the recipient's default read; if they already read it, they get a
+            msg_type='cancel' notice telling them to stop.
+        expires_in_seconds: Optional deadline. Past it the message no longer
+            counts as unread work and is hidden from the default read.
+
+    Delivery (v0.7.0+): the response carries `delivery`, an assessment of
+    whether `to` will actually see this: registered, wakeable (a live
+    dlb-monitor heartbeat), status, last_seen / heartbeat ages, and a
+    `warning` (null when delivery looks fine). wakeable=False means an idle
+    recipient session will not wake for it; tell the user, or pick an active
+    recipient, instead of waiting.
 
     Read-receipts (v0.3.2+): when the recipient reads a message you sent with
     msg_type='task' (and you sent it under a registered name), DLB drops a
@@ -436,8 +475,12 @@ def send(
         msg_type=msg_type,
         in_reply_to=in_reply_to,
         headline=headline,
+        supersedes=supersedes,
+        expires_in_seconds=expires_in_seconds,
     )
-    return _message_dict(msg)
+    d = _message_dict(msg)
+    d["delivery"] = store.dispatch_assessment(to)
+    return d
 
 
 @mcp.tool()
@@ -446,6 +489,9 @@ def read(
     session_token: str | None = None,
     unread_only: bool = True,
     limit: int = 20,
+    order: str = "newest",
+    exclude_types: list[str] | None = None,
+    include_inactive: bool = False,
 ) -> list[dict[str, Any]]:
     """Read messages in `name`'s inbox. Auto-marks them read.
 
@@ -461,12 +507,23 @@ def read(
         unread_only: If True (default), only returns messages with read_at
             still NULL at the time of this call.
         limit: Max messages to return (1-1000). Default 20.
+        order: "newest" (default) or "oldest". Use "oldest" to work an inbox
+            in arrival order, so a follow-up is never handled before the task
+            it refers to.
+        exclude_types: msg_types to leave out, e.g. ["receipt"]. Excluded
+            messages are not returned and stay unread.
+        include_inactive: By default cancelled, superseded and past-deadline
+            messages are hidden (they are not work any more). True shows them,
+            each with a `lifecycle` key saying why.
     """
     msgs = store.read(
         name=name,
         session_token=session_token,
         unread_only=unread_only,
         limit=limit,
+        order=order,
+        exclude_types=exclude_types,
+        include_inactive=include_inactive,
     )
     return [_message_dict(m) for m in msgs]
 
@@ -560,6 +617,99 @@ def get_task_status(message_id: int) -> dict[str, Any] | None:
         message_id: The id you received from send() when you dispatched a task.
     """
     return store.get_task_status(message_id)
+
+
+@mcp.tool()
+def cancel_task(message_id: int, session_token: str, reason: str | None = None) -> dict[str, Any]:
+    """Withdraw a message you sent (v0.7.0+). Idempotent.
+
+    Only the authenticated original sender may cancel. A cancelled message is
+    hidden from the recipient's default read and stops counting as unread
+    work. If the recipient had ALREADY read it, they also get a
+    msg_type='cancel' notice so they stop working on it.
+
+    To replace a task rather than just drop it, use send(supersedes=<id>).
+
+    Returns {"cancelled": true, "already": bool, "notified": bool}.
+
+    Args:
+        message_id: The id send() returned for the message to withdraw.
+        session_token: Your token (must be the message's sender).
+        reason: Optional short reason, included in the cancel notice.
+    """
+    return store.cancel_task(message_id, session_token, reason)
+
+
+@mcp.tool()
+def claim(
+    key: str,
+    name: str,
+    session_token: str,
+    ttl_seconds: int = store.DEFAULT_CLAIM_TTL_SECONDS,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Atomically claim a piece of work before starting it (v0.7.0+).
+
+    `key` is any string naming the work: a task id, a file path, a PR. The
+    check and the write happen in one transaction, so when two agents race
+    for the same key exactly one gets claimed=true; the other gets
+    claimed=false plus the current `holder`. Use this instead of
+    "list_threads, see nobody on it, announce I'm taking it", which lets two
+    agents start the same work.
+
+    Calling again while you hold the key renews the TTL (do this on long
+    work). An expired claim is free for the next caller (`took_over_from`
+    names the old holder). unregister releases all of a name's claims.
+
+    Args:
+        key: What you are claiming.
+        name: Your registered name.
+        session_token: Token for `name`.
+        ttl_seconds: How long the claim lasts without renewal. Default 900
+            (15 min), max 7 days.
+        note: Optional free text shown to others in list_claims.
+    """
+    return store.claim(key, name, session_token, ttl_seconds=ttl_seconds, note=note)
+
+
+@mcp.tool()
+def release(key: str, name: str, session_token: str) -> dict[str, Any]:
+    """Release a claim you hold (v0.7.0+). Releasing a key you don't hold is a
+    no-op (released=false) that reports the current holder, if any.
+
+    Args:
+        key: The claimed key.
+        name: Your registered name.
+        session_token: Token for `name`.
+    """
+    return store.release(key, name, session_token)
+
+
+@mcp.tool()
+def list_claims(prefix: str | None = None) -> list[dict[str, Any]]:
+    """List live (unexpired) claims, oldest first (v0.7.0+). No auth.
+
+    Args:
+        prefix: Optional key prefix filter, e.g. "pr/" or "CR-".
+    """
+    return store.list_claims(prefix)
+
+
+@mcp.tool()
+def set_receipts(name: str, session_token: str, enabled: bool) -> dict[str, Any]:
+    """Turn auto read-receipts on or off for tasks YOU send (v0.7.0+).
+
+    Receipts are on by default. A coordinator that tracks tasks with
+    get_task_status, or that dispatches to many workers, can switch them off
+    so its inbox only holds real replies. Receipts never count toward
+    unread_count either way (list_threads reports them as unread_receipts).
+
+    Args:
+        name: Your registered name.
+        session_token: Token for `name`.
+        enabled: False to stop receiving receipts, True to resume.
+    """
+    return store.set_receipts(name, session_token, enabled)
 
 
 # ── Stdio entry point ────────────────────────────────────────────────────────
