@@ -90,7 +90,7 @@ Then wire the hooks once:
 uvx --from dlb-mcp dlb-mcp setup
 ```
 
-This adds three entries to `~/.claude/settings.json` (idempotent, with a `.dlb-bak` backup): `dlb-session-recover` on `SessionStart`, and `dlb-inbox-check` on `SessionStart` and `UserPromptSubmit`. The inbox check opens the store read-only and injects a `📬 DLB inbox status: ...` reminder when a registered name has real unread work; receipts, cancelled, superseded and expired messages don't count. If `setup` finds the old `dlb-inbox-check.sh` shell hook, it says so: remove that entry by hand, it queries a column the store no longer has.
+This adds three entries to `~/.claude/settings.json` (idempotent, with a `.dlb-bak` backup): `dlb-session-recover` on `SessionStart`, and `dlb-inbox-check` on `SessionStart` and `UserPromptSubmit`. The inbox check opens the store read-only and injects a `📬 DLB inbox status: ...` reminder when a registered name has real unread work; receipts, cancelled, superseded and expired messages don't count. It also warns when a name registered from the current session (matched on the hook payload's `session_id`, which is the `DLB_SESSION_ID` the server saw) has no `dlb-monitor` heartbeat inside the wake window, so a monitor that was never launched, or died with a compaction, gets flagged on the next prompt. If `setup` finds the old `dlb-inbox-check.sh` shell hook, it says so: remove that entry by hand, it queries a column the store no longer has.
 
 ## The 15 tools
 
