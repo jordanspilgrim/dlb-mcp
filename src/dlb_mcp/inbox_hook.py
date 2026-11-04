@@ -77,6 +77,10 @@ def unread_counts(session_id: str | None = None) -> list[tuple[str, int]]:
         if "expires_at_ms" in cols:
             where.append("(expires_at_ms IS NULL OR expires_at_ms > ?)")
             params.append(int(time.time() * 1000))
+        # Only registered names: a dead-letter recipient (send accepts any
+        # name) has no session that could read it, so reminding about it on
+        # every prompt is noise.
+        where.append("recipient_name IN (SELECT name FROM agents)")
         if session_id:
             agent_cols = {r[1] for r in conn.execute("PRAGMA table_info(agents)")}
             if "session_id" in agent_cols:

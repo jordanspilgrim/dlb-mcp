@@ -82,6 +82,27 @@ def test_unread_counts_scoped_to_session(monkeypatch: pytest.MonkeyPatch) -> Non
     assert inbox_hook.unread_counts(None) == [("mine", 1), ("theirs", 1)]
 
 
+def test_unread_counts_skips_unregistered_recipients() -> None:
+    _reg("real")
+    store.send("real", "hi")
+    store.send("ghost", "queued for a name nobody holds")
+    assert inbox_hook.unread_counts(None) == [("real", 1)]
+
+
+def test_huge_expiry_rejected_before_insert(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Even with the TTL env pushed far past the clamp, the deadline stays
+    # within int64 and datetime range, and nothing is committed.
+    monkeypatch.setenv("DLB_MESSAGE_TTL_DAYS", str(10**12))
+    store.init_schema()
+    for v in (10**12, 10**20):
+        with pytest.raises(store.DLBError):
+            store.send("b", "x", expires_in_seconds=v)
+    with sqlite3.connect(str(store.store_path())) as c:
+        assert c.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+    m = store.send("b", "x", expires_in_seconds=store.ttl_days() * 86400)
+    assert m.id
+
+
 def test_render_caps_listing() -> None:
     counts = [(f"n{i:03d}", 1) for i in range(inbox_hook.MAX_LISTED + 5)]
     out = render_text(inbox_hook.render("UserPromptSubmit", counts))
