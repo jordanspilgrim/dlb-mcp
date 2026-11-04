@@ -84,22 +84,46 @@ Add to `~/.claude.json`:
 
 Every session that points here shares `~/.dlb/store.sqlite3` via SQLite WAL mode. Start as many as you like.
 
-## The 10 tools
+Then wire the hooks once:
+
+```bash
+uvx --from dlb-mcp dlb-mcp setup
+```
+
+This adds three entries to `~/.claude/settings.json` (idempotent, with a `.dlb-bak` backup): `dlb-session-recover` on `SessionStart`, and `dlb-inbox-check` on `SessionStart` and `UserPromptSubmit`. The inbox check opens the store read-only and injects a `📬 DLB inbox status: ...` reminder when a registered name has real unread work; receipts, cancelled, superseded and expired messages don't count. It also warns when a name registered from the current session (matched on the hook payload's `session_id`, which is the `DLB_SESSION_ID` the server saw) has no `dlb-monitor` heartbeat inside the wake window, so a monitor that was never launched, or died with a compaction, gets flagged on the next prompt. If `setup` finds the old `dlb-inbox-check.sh` shell hook, it says so: remove that entry by hand, it queries a column the store no longer has.
+
+## The 15 tools
 
 | Tool | What it does |
 |---|---|
 | `register(name, working_on=None, force=False, prior_token=None)` | Declare a name plus status. Returns `session_token`. Conflict on an existing active name returns an error with a suggestion. `force=True` requires either `prior_token` matching the holder, or the holder being stale > `DLB_TAKEOVER_AFTER_SECONDS`. |
 | `recover_token(name)` | Re-obtain the `session_token` for a name **this session** registered, after losing it (the common cause is context compaction). Same process, or same `DLB_SESSION_ID` once the prior holder is stale, returns the token; a different session is refused. Use this instead of re-registering, which would trip the takeover gate on your own live name. |
 | `set_status(name, session_token, status, detail=None)` | Report your liveness: `working` / `idle` / `blocked` / `done` (any string accepted), plus an optional `detail`. Doubles as a heartbeat, so a coordinator reading `list_threads` sees real state instead of guessing from `last_seen`. |
-| `list_threads(active_within_hours=24, include_stale=False, only_unread=False, working_on_chars=140)` | See who's around, with unread counts and staleness flags. No auth. |
-| `send(to, body, subject=None, from_=None, session_token=None, msg_type=None, in_reply_to=None)` | Drop a message. Always succeeds (subject to size cap), even if `to` doesn't exist yet. Pass `session_token` to bind `from_` to your registered name (otherwise `from_` is unverified free text). Pass `msg_type="task"` for messages the recipient must acknowledge; `in_reply_to=<id>` to thread a reply. |
-| `read(name, session_token, unread_only=True, limit=20)` | Read inbox. Requires `session_token` for registered names. Returns full lifecycle fields on each message. |
+| `list_threads(active_within_hours=24, include_stale=False, only_unread=False, working_on_chars=140)` | See who's around, with unread counts and staleness flags. Read receipts are counted apart (`unread_receipts`), so `unread_count` means real work. `wakeable` is true when the agent's `dlb-monitor` has sent a heartbeat inside the wake window. No auth. |
+| `send(to, body, subject=None, from_=None, session_token=None, msg_type=None, in_reply_to=None, headline=None, supersedes=None, expires_in_seconds=None)` | Drop a message. Always succeeds (subject to size cap), even if `to` doesn't exist yet. Pass `session_token` to bind `from_` to your registered name (otherwise `from_` is unverified free text). Pass `msg_type="task"` for messages the recipient must acknowledge; `in_reply_to=<id>` to thread a reply. `supersedes=<id>` retires one of your earlier messages in favour of this one; `expires_in_seconds` hides the message once it goes stale. The result carries a `delivery` block (see [Dispatch reliability](#dispatch-reliability)). |
+| `read(name, session_token, unread_only=True, limit=20, order="newest", exclude_types=None, include_inactive=False)` | Read inbox. Requires `session_token` for registered names. Returns full lifecycle fields on each message, including `lifecycle` (`cancelled` / `superseded` / `expired` / null). `order="oldest"` reads in arrival order; `exclude_types=["receipt"]` skips types and leaves them unread; `include_inactive=True` also shows cancelled, superseded and expired rows. |
 | `ack(message_id, session_token)` | Explicit "I saw this and acted on it". Optional; superseded by `update_status` for the common case. |
-| `unregister(name, session_token)` | Release the name. Messages preserved for re-registration. |
+| `unregister(name, session_token)` | Release the name and any claims it holds. Messages preserved for re-registration. |
 | `update_status(message_id, status, session_token, note=None)` | Recipient signals lifecycle state on a message they received. Convention: `queued/accepted/running/done/blocked` (any string accepted). Also sets `read_at` if the message was still unread. |
 | `get_task_status(message_id)` | Sender-side probe. No auth: returns the current `status`, `status_note`, `msg_type`, `in_reply_to`, and `read_at` of any message id. Lightweight (does NOT return the body). Answers "did my task get picked up?". |
+| `cancel_task(message_id, session_token, reason=None)` | Sender withdraws a message it sent. An unread message disappears from the inbox; one already read gets a `msg_type="cancel"` notice threaded to it. Idempotent. |
+| `claim(key, name, session_token, ttl_seconds=900, note=None)` | Atomically claim a piece of work (a task id, a file, a PR). Exactly one caller wins; the rest get `claimed: false` and the current `holder`. The holder renews by claiming again. Expired claims can be taken over. |
+| `release(key, name, session_token)` | Give a claim back. Only the holder can release. |
+| `list_claims(prefix=None)` | Live claims, optionally filtered by key prefix. No auth. |
+| `set_receipts(name, session_token, enabled)` | Opt out of (or back into) read receipts for tasks you send. |
 
 That's the entire API.
+
+## Dispatch reliability
+
+Agents that coordinate over DLB hit the same handful of failures. Each has a direct answer:
+
+- **Sending to someone who will never wake.** Every `send` returns a `delivery` block: `registered`, `wakeable`, `status`, `last_seen_age_seconds`, `monitor_heartbeat_age_seconds` and a plain-English `warning` when the recipient is unregistered, has no live `dlb-monitor`, or last reported `done` / `blocked`. Route the work elsewhere instead of waiting.
+- **Proving a session is wakeable.** `dlb-monitor` writes a heartbeat every 30 seconds. An agent counts as `wakeable` while its last heartbeat is younger than `DLB_WAKE_WINDOW_SECONDS` (default 120).
+- **Changing your mind.** `cancel_task` withdraws a task; `send(..., supersedes=<id>)` replaces it. `expires_in_seconds` lets a time-boxed request lapse on its own.
+- **Two agents grabbing the same work.** `claim` is a single atomic write; there is no read-then-write gap to race through.
+- **Receipt noise.** Receipts no longer inflate `unread_count`, the inbox hook ignores them, and `set_receipts(..., False)` stops them entirely.
+- **Reading out of order.** `read(..., order="oldest")` works a queue front to back.
 
 ## Task lifecycle: closing the "delivered ≠ acted on" gap
 
@@ -180,6 +204,7 @@ The two are complementary: `dlb-monitor` is the cleanest fit for Claude Code, `d
 | `DLB_MAX_INBOX` | `1000` | Per-recipient ring-buffer cap; oldest messages drop past this |
 | `DLB_TAKEOVER_AFTER_SECONDS` | `86400` (24h) | How long a holder must be silent before `force=True` without `prior_token` can evict them |
 | `DLB_SESSION_ID` | *(harness-set)* | Stable per-session id used by `recover_token` to re-grant a token to the same session after an MCP-server respawn |
+| `DLB_WAKE_WINDOW_SECONDS` | `120` | Max age of a `dlb-monitor` heartbeat that still counts as `wakeable` |
 | `DLB_MONITOR_INTERVAL` | `2.0` | Default poll interval for `dlb-monitor` (overridable via `--interval`) |
 
 ## Trust model: coordination, not confidentiality

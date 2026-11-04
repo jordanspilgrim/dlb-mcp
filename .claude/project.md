@@ -6,6 +6,7 @@ The per-project half of the shared Claude Code agent harness. The roster, `/kick
 
 ```yaml
 name: dlb-mcp
+project_root: /Users/gabriel/ClaudeCode/dlb-mcp
 stack: "Python 3.11+ (3.11/3.12/3.13 in CI) · MCP server on mcp[cli]>=1.2.0 · stdlib sqlite3 store (WAL, hashed-at-rest tokens) · uv + hatchling build · pytest + pytest-asyncio (asyncio_mode=auto) · ruff (line-length 100; E,F,I,UP,B,SIM). Three console entrypoints: dlb-mcp (stdio server), dlb-monitor (push-like wake), dlb-session-recover (SessionStart hook). No UI, no web framework, no ORM."
 base_ref: origin/main
 worktree_isolation: true

@@ -120,7 +120,7 @@ def _call(server: subprocess.Popen, call_id: int, tool: str, args: dict) -> dict
 
 def test_full_happy_path(server: subprocess.Popen) -> None:
     """Tool catalog → register → send → read → ack → unregister."""
-    # 1. List tools: the full DLB tool catalog (9 as of v0.3.1).
+    # 1. List tools: the full DLB tool catalog (15 as of v0.7.0).
     tools_resp = _send_rpc(server, [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}])
     assert tools_resp
     tools = tools_resp[0]["result"]["tools"]
@@ -136,6 +136,11 @@ def test_full_happy_path(server: subprocess.Popen) -> None:
         "unregister",
         "update_status",
         "get_task_status",
+        "cancel_task",
+        "claim",
+        "release",
+        "list_claims",
+        "set_receipts",
     }, f"unexpected tool set: {names}"
 
     # 2. Register alpha
@@ -148,6 +153,10 @@ def test_full_happy_path(server: subprocess.Popen) -> None:
     sent = _call(server, 3, "send", {"to": "alpha", "body": "hello alpha"})
     assert sent["recipient_name"] == "alpha"
     assert sent["sender_name"] == "anonymous"
+    # alpha is registered but runs no dlb-monitor, so the sender is warned.
+    assert sent["delivery"]["registered"] is True
+    assert sent["delivery"]["wakeable"] is False
+    assert sent["delivery"]["warning"]
     msg_id = sent["id"]
 
     # 4. Read alpha's inbox with the token, should find the message

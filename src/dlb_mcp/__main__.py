@@ -2,7 +2,7 @@
 
 Subcommands:
   (none)   run the stdio MCP server (the default; what your MCP client invokes)
-  setup    wire the SessionStart recovery hook into ~/.claude/settings.json
+  setup    wire the recovery + inbox-check hooks into ~/.claude/settings.json
 """
 
 from __future__ import annotations
@@ -16,7 +16,8 @@ _HELP = (
     "\n"
     "Usage:\n"
     "  dlb-mcp            Run the MCP server (speaks MCP over stdin/stdout).\n"
-    "  dlb-mcp setup      Wire the SessionStart recovery hook into\n"
+    "  dlb-mcp setup      Wire the SessionStart recovery hook and the\n"
+    "                     SessionStart/UserPromptSubmit inbox-check hooks into\n"
     "                     ~/.claude/settings.json (idempotent).\n"
     "\n"
     "Env vars:\n"
@@ -26,7 +27,9 @@ _HELP = (
     "  DLB_MAX_BODY_BYTES     Max message body size (default 262144 = 256 KiB)\n"
     "  DLB_MAX_FIELD_BYTES    Max metadata field size (default 8192 = 8 KiB)\n"
     "  DLB_MAX_INBOX          Per-recipient inbox cap, drop-oldest (default 1000; 0=off)\n"
-    "  DLB_SESSION_ID         Per-session id for recover_token identity (unset=off).\n"
+    "  DLB_WAKE_WINDOW_SECONDS  Max dlb-monitor heartbeat age that still counts\n"
+    "                         as wakeable (default 120)\n"
+    "  DLB_SESSION_ID        Per-session id for recover_token identity (unset=off).\n"
     "                         Wire from the harness session id (e.g.\n"
     "                         CLAUDE_CODE_SESSION_ID); must be unique per session.\n"
 )

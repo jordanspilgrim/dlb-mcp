@@ -1,12 +1,25 @@
-"""``dlb-mcp setup``: wire the SessionStart recovery hook into Claude Code.
+"""``dlb-mcp setup``: wire DLB's Claude Code hooks.
 
-Idempotently adds a SessionStart hook running ``dlb-session-recover`` to the
-user's ``~/.claude/settings.json`` (global / machine-wide). Design rules:
+Idempotently adds to the user's ``~/.claude/settings.json`` (global /
+machine-wide):
 
-- **Idempotent:** if the hook is already present, do nothing.
+- SessionStart: ``dlb-session-recover`` (token recovery reminder) and
+  ``dlb-inbox-check SessionStart`` (unread mail on session start);
+- UserPromptSubmit: ``dlb-inbox-check UserPromptSubmit`` (unread mail on every
+  prompt, so a session without dlb-monitor still sees mail on its next turn).
+
+Design rules:
+
+- **Idempotent:** hooks already present are left alone; only missing ones are added.
 - **Never clobber:** on unreadable / invalid-JSON / wrong-shape settings, abort
   with a clear message instead of overwriting. Back up before any write.
 - **Preserve:** existing hooks (PreToolUse etc.) and other keys are untouched.
+  The legacy ``dlb-inbox-check.sh`` is reported, never removed.
+- **Runnable:** a hook command whose console script is not on PATH (common
+  when the package runs via ``uvx`` and was never ``uv tool install``-ed) is
+  written as ``uvx --from dlb-mcp <cmd>`` when ``uvx`` is available, so the
+  hook does not fail with "command not found" on every prompt. If neither is
+  on PATH the bare command is written and the message says so.
 """
 
 from __future__ import annotations
@@ -16,27 +29,105 @@ import shutil
 from pathlib import Path
 
 HOOK_COMMAND = "dlb-session-recover"
+INBOX_COMMAND = "dlb-inbox-check"
+
+# (event, exact command) pairs `setup` guarantees are present.
+REQUIRED_HOOKS: tuple[tuple[str, str], ...] = (
+    ("SessionStart", HOOK_COMMAND),
+    ("SessionStart", f"{INBOX_COMMAND} SessionStart"),
+    ("UserPromptSubmit", f"{INBOX_COMMAND} UserPromptSubmit"),
+)
+
+# The hand-written hook this package replaces. It queried a column that does
+# not exist (read_at instead of read_at_ms), so it never reported anything.
+LEGACY_INBOX_HOOK = "dlb-inbox-check.sh"
+
+# Package spec for the uvx fallback.
+UVX_FROM = "dlb-mcp"
 
 
 def _settings_path() -> Path:
     return Path.home() / ".claude" / "settings.json"
 
 
-def _has_hook(settings: dict) -> bool:
+def _commands(settings: dict, event: str) -> list[str]:
     hooks = settings.get("hooks")
     if not isinstance(hooks, dict):
-        return False
-    for group in hooks.get("SessionStart", []) or []:
+        return []
+    groups = hooks.get(event, []) or []
+    if not isinstance(groups, list):
+        return []
+    out: list[str] = []
+    for group in groups:
         if not isinstance(group, dict):
             continue
         for h in group.get("hooks", []) or []:
-            if isinstance(h, dict) and HOOK_COMMAND in (h.get("command") or ""):
-                return True
+            if isinstance(h, dict) and isinstance(h.get("command"), str):
+                out.append(h["command"].strip())
+    return out
+
+
+def _strip_uvx(argv: list[str]) -> list[str]:
+    """``uvx --from dlb-mcp[==x] <cmd> ...`` (or ``--from=``) -> ``<cmd> ...``."""
+    if not argv or argv[0].rsplit("/", 1)[-1] != "uvx":
+        return argv
+    rest = argv[1:]
+    if len(rest) >= 2 and rest[0] == "--from":
+        spec, rest = rest[1], rest[2:]
+    elif rest and rest[0].startswith("--from="):
+        spec, rest = rest[0].split("=", 1)[1], rest[1:]
+    else:
+        return argv
+    name = spec.split("==", 1)[0].split("@", 1)[0].strip()
+    return rest if name == UVX_FROM else argv
+
+
+def _has_command(settings: dict, event: str, command: str) -> bool:
+    """True if `command` is wired for `event`. Matches the command itself (an
+    absolute path to the same console script counts, as does the
+    ``uvx --from dlb-mcp`` form), not a substring, so the legacy
+    ``dlb-inbox-check.sh`` is never mistaken for the real hook."""
+    want = command.split()
+    for cmd in _commands(settings, event):
+        have = _strip_uvx(cmd.split())
+        if have and have[0].rsplit("/", 1)[-1] == want[0] and have[1:] == want[1:]:
+            return True
     return False
 
 
+def _runnable(command: str) -> tuple[str, bool]:
+    """The command line to write for `command`, and whether it will resolve.
+
+    The console script itself when it is on PATH; else the uvx form when
+    ``uvx`` is on PATH; else the bare command, flagged as unresolvable.
+    """
+    exe = command.split()[0]
+    if shutil.which(exe):
+        return command, True
+    if shutil.which("uvx"):
+        return f"uvx --from {UVX_FROM} {command}", True
+    return command, False
+
+
+def _has_hook(settings: dict) -> bool:
+    """Back-compat: is the SessionStart recovery hook wired?"""
+    return _has_command(settings, "SessionStart", HOOK_COMMAND)
+
+
+def _missing(settings: dict) -> list[tuple[str, str]]:
+    return [(e, c) for e, c in REQUIRED_HOOKS if not _has_command(settings, e, c)]
+
+
+def _legacy_events(settings: dict) -> list[str]:
+    return [
+        event
+        for event in ("SessionStart", "UserPromptSubmit")
+        if any(LEGACY_INBOX_HOOK in c for c in _commands(settings, event))
+    ]
+
+
 def wire_session_hook(path: Path | None = None) -> tuple[bool, str]:
-    """Add the SessionStart recovery hook idempotently.
+    """Add every hook in REQUIRED_HOOKS idempotently.
 
     Returns (changed, message). `changed` is False for a no-op (already wired)
     or an abort (error); True when the file was written.
@@ -47,28 +138,47 @@ def wire_session_hook(path: Path | None = None) -> tuple[bool, str]:
         try:
             settings = json.loads(p.read_text())
         except OSError as e:
-            return False, f"error: cannot read {p}: {e}. Add the hook by hand."
+            return False, f"error: cannot read {p}: {e}. Add the hooks by hand."
         except json.JSONDecodeError as e:
             return False, (
                 f"error: {p} exists but is not valid JSON ({e}); refusing to "
-                "modify it. Fix the JSON or add the hook by hand."
+                "modify it. Fix the JSON or add the hooks by hand."
             )
         if not isinstance(settings, dict):
             return False, f"error: {p} is not a JSON object; not modifying it."
     else:
         settings = {}
 
-    if _has_hook(settings):
-        return False, f"ok: SessionStart hook already wired in {p}, nothing to do."
+    legacy = _legacy_events(settings)
+    legacy_note = (
+        f" Note: {p} still wires the old {LEGACY_INBOX_HOOK} on "
+        f"{', '.join(legacy)}. It never reported mail (it queries a column that "
+        "does not exist); remove those entries, dlb-inbox-check replaces them."
+        if legacy
+        else ""
+    )
+
+    missing = _missing(settings)
+    if not missing:
+        return False, f"ok: DLB hooks already wired in {p}, nothing to do.{legacy_note}"
 
     hooks = settings.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         return False, f"error: {p} has a non-object 'hooks' key; not modifying it."
-    session_start = hooks.setdefault("SessionStart", [])
-    if not isinstance(session_start, list):
-        return False, f"error: {p} has a non-list 'hooks.SessionStart'; not modifying it."
-
-    session_start.append({"hooks": [{"type": "command", "command": HOOK_COMMAND}]})
+    resolved = {c: _runnable(c) for _, c in missing}
+    events = list(dict.fromkeys(e for e, _ in missing))
+    for event in events:
+        if not isinstance(hooks.setdefault(event, []), list):
+            return False, f"error: {p} has a non-list 'hooks.{event}'; not modifying it."
+    for event in events:
+        # One new group per event, holding every command that event is missing.
+        hooks[event].append(
+            {
+                "hooks": [
+                    {"type": "command", "command": resolved[c][0]} for e, c in missing if e == event
+                ]
+            }
+        )
 
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -78,9 +188,18 @@ def wire_session_hook(path: Path | None = None) -> tuple[bool, str]:
     except OSError as e:
         return False, f"error: failed to write {p}: {e}"
 
+    wired = ", ".join(f"{e}: {resolved[c][0]}" for e, c in missing)
+    unresolved = sorted({c.split()[0] for _, c in missing if not resolved[c][1]})
+    path_note = (
+        f" Warning: {', '.join(unresolved)} is not on PATH and uvx is not "
+        "available, so the hook will fail until you install the package "
+        "(uv tool install dlb-mcp) or put its scripts on PATH."
+        if unresolved
+        else ""
+    )
     return True, (
-        f"ok: wired SessionStart hook ({HOOK_COMMAND}) into {p}. "
-        "Restart your Claude Code session to activate."
+        f"ok: wired DLB hooks ({wired}) into {p}. "
+        f"Restart your Claude Code session to activate.{path_note}{legacy_note}"
     )
 
 
