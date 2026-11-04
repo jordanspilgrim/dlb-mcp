@@ -10,6 +10,7 @@ import pytest
 
 from dlb_mcp import store
 from dlb_mcp.store import AuthError, DLBError
+from tests._schema import assert_store_current
 
 
 def _summary(name: str):
@@ -90,4 +91,5 @@ def test_v4_db_migrates_to_v5_with_status_columns(isolated_store: Path):
     assert "status" in cols and "status_detail" in cols
     # init_schema always migrates to the current schema (v6+ adds session_id);
     # this test pins "v4 → fully migrated", so track SCHEMA_VERSION, not a literal.
-    assert version == store.SCHEMA_VERSION
+    del version
+    assert_store_current(isolated_store)

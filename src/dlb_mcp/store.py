@@ -10,7 +10,9 @@ Schema (v2):
     messages(id PK, recipient_name, sender_name, subject, body,
              sent_at_ms, read_at_ms, expires_at_ms)
 
-Schema version is tracked via PRAGMA user_version. v1 used TEXT ISO timestamps
+Schema version is tracked in the dlb_meta table (key 'schema_version'), while
+PRAGMA user_version holds the MINIMUM reader version (see MIN_READER_VERSION),
+so additive upgrades don't lock out older readers. v1 used TEXT ISO timestamps
 which compared correctly only by lexicographic accident of the chosen format;
 v2 uses INTEGER epoch-ms which compares numerically and cannot silently break
 under format drift. Migration from v1 is automatic on first connect.
@@ -70,6 +72,10 @@ DEFAULT_MAX_INBOX_MESSAGES = 1000
 DEFAULT_TAKEOVER_AFTER_SECONDS = 24 * 60 * 60  # 24h: matches list_threads' default stale window
 
 SCHEMA_VERSION = 9  # v9: cancel/supersede/deadline, monitor heartbeat, receipt opt-out, claims
+# Oldest schema a reader may support and still use this store safely. Stamped
+# into PRAGMA user_version (which 0.6.x builds treat as "the store's version").
+# v9 only adds nullable columns and new tables, so v8 readers stay compatible.
+MIN_READER_VERSION = 8
 DEFAULT_WAKE_WINDOW_SECONDS = 120  # a monitor heartbeat newer than this = wakeable
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 MAX_CLAIM_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -340,6 +346,8 @@ class Message:
     cancel_reason: str | None = None
     superseded_by: int | None = None
     deadline: datetime | None = None
+    # Set only on the Message send() returns: the id this send superseded.
+    supersedes: int | None = None
 
     @property
     def lifecycle(self) -> str | None:
@@ -424,40 +432,75 @@ def init_schema() -> None:
     instead of letting raw `no such column` errors leak from every operation.
     """
     with _connect() as conn:
-        current = conn.execute("PRAGMA user_version").fetchone()[0]
-        if current == SCHEMA_VERSION:
+        if _schema_is_current(conn):
             return
-        if current > SCHEMA_VERSION:
-            raise DLBError(
-                f"DLB store schema v{current} is newer than this dlb-mcp "
-                f"(supports v{SCHEMA_VERSION}). Upgrade dlb-mcp to match."
-            )
         conn.execute("BEGIN IMMEDIATE")
         try:
             # Re-read under the lock: another process may have migrated while we
             # waited for the write lock. This closes the check-then-act window
-            # that let concurrent callers double-run migrations and throw.
-            current = conn.execute("PRAGMA user_version").fetchone()[0]
-            if current == SCHEMA_VERSION:
+            # that let concurrent callers double-run migrations and throw. The
+            # forward-compat guard repeats here too, so a NEWER dlb-mcp that
+            # upgraded the store while we waited still gets the clear error.
+            if _schema_is_current(conn):
                 conn.execute("COMMIT")
                 return
-            if current > SCHEMA_VERSION:
-                # A NEWER dlb-mcp upgraded the store while we waited for the lock.
-                # Repeat the forward-compat guard here (not just before the lock)
-                # so we raise the clear error instead of returning "success" and
-                # then leaking raw errors against an unsupported newer schema.
-                conn.execute("ROLLBACK")
-                raise DLBError(
-                    f"DLB store schema v{current} is newer than this dlb-mcp "
-                    f"(supports v{SCHEMA_VERSION}). Upgrade dlb-mcp to match."
-                )
             _apply_migrations(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            _create_meta_table(conn)
+            conn.execute(
+                "INSERT INTO dlb_meta (key, value) VALUES ('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(SCHEMA_VERSION),),
+            )
+            # user_version is the MINIMUM reader version, not the schema version:
+            # every v9 change is additive and nullable, so a v8 build (0.6.x) can
+            # keep reading and writing this store during a rolling upgrade.
+            conn.execute(f"PRAGMA user_version = {MIN_READER_VERSION}")
             conn.execute("COMMIT")
         except Exception:
             with suppress(sqlite3.OperationalError):
                 conn.execute("ROLLBACK")
             raise
+
+
+def _create_meta_table(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE TABLE IF NOT EXISTS dlb_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+
+
+def _schema_is_current(conn: sqlite3.Connection) -> bool:
+    """True if the store needs no migration. Raises if this build is too old.
+
+    Two version numbers live in the store:
+      * PRAGMA user_version = the minimum dlb-mcp schema a READER must support.
+        Older builds compare against this, so additive upgrades don't lock them out.
+      * dlb_meta.schema_version = the schema the store was actually migrated to.
+    A store without dlb_meta predates this split (v8 and below, or a dev v9 store
+    stamped user_version=9) and is migrated, which is idempotent.
+    """
+    min_reader = conn.execute("PRAGMA user_version").fetchone()[0]
+    if min_reader > SCHEMA_VERSION:
+        raise DLBError(
+            f"DLB store requires dlb-mcp schema v{min_reader}+, newer than this "
+            f"dlb-mcp (supports v{SCHEMA_VERSION}). Upgrade dlb-mcp to match."
+        )
+    has_meta = (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dlb_meta'"
+        ).fetchone()
+        is not None
+    )
+    if not has_meta:
+        return False
+    row = conn.execute("SELECT value FROM dlb_meta WHERE key = 'schema_version'").fetchone()
+    if row is None:
+        return False
+    try:
+        stored = int(row[0])
+    except (TypeError, ValueError):
+        return False
+    # A meta row with a stale min-reader stamp (a crash between the meta write
+    # and the PRAGMA cannot happen inside one transaction, but a hand-edited or
+    # partially-restored store can) is re-stamped by the migrate path.
+    return stored >= SCHEMA_VERSION and min_reader >= MIN_READER_VERSION
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
@@ -843,9 +886,18 @@ def _now_ms() -> int:
 
 
 def _ms_to_dt(ms: int | None) -> datetime | None:
+    """Convert stored epoch-ms to an aware datetime, tolerating bad rows.
+
+    A row written by an older or buggy client can hold a timestamp outside
+    datetime's range. Raising here would make every read of that inbox fail,
+    so an unrepresentable value clamps to datetime.max / datetime.min instead.
+    """
     if ms is None:
         return None
-    return datetime.fromtimestamp(ms / 1000, tz=UTC)
+    try:
+        return datetime.fromtimestamp(ms / 1000, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return datetime.max.replace(tzinfo=UTC) if ms > 0 else datetime.min.replace(tzinfo=UTC)
 
 
 def _iso_to_ms(s: str | None) -> int | None:
@@ -913,7 +965,9 @@ def _purge_expired(conn: sqlite3.Connection, *, recipient: str | None = None) ->
     return cur.rowcount
 
 
-def _enforce_inbox_cap(conn: sqlite3.Connection, recipient: str) -> int:
+def _enforce_inbox_cap(
+    conn: sqlite3.Connection, recipient: str, *, exempt_ids: tuple[int, ...] = ()
+) -> int:
     """Trim `recipient`'s inbox to the newest max_inbox_messages() rows.
 
     Ring-buffer semantics: keeps the highest-id (newest) N messages and deletes
@@ -924,16 +978,28 @@ def _enforce_inbox_cap(conn: sqlite3.Connection, recipient: str) -> int:
     Trade-off (owner-chosen): under a sustained flood this can drop a real
     queued-but-unread message. That is preferable to unbounded row growth in
     DLB's cooperative model; raise DLB_MAX_INBOX or set it to 0 to opt out.
+
+    `exempt_ids` are never dropped: the caller passes the rows it just wrote
+    in this transaction (a new message plus its cancel notice) so the trim can
+    never delete the very mail that triggered it.
     """
     cap = max_inbox_messages()
     if cap <= 0:
         return 0
+    exempt = tuple(i for i in exempt_ids if i is not None)
+    extra = f" AND id NOT IN ({','.join('?' * len(exempt))})" if exempt else ""
     cur = conn.execute(
         "DELETE FROM messages WHERE recipient_name = ? AND id NOT IN ("
-        "SELECT id FROM messages WHERE recipient_name = ? ORDER BY id DESC LIMIT ?)",
-        (recipient, recipient, cap),
+        f"SELECT id FROM messages WHERE recipient_name = ? ORDER BY id DESC LIMIT ?){extra}",
+        (recipient, recipient, cap, *exempt),
     )
     return cur.rowcount
+
+
+def _is_wakeable(hb_ms: int | None, now_ms: int) -> bool:
+    """One definition of 'a live dlb-monitor is watching', shared by
+    list_threads and dispatch_assessment so they can never disagree."""
+    return hb_ms is not None and (now_ms - hb_ms) <= wake_window_seconds() * 1000
 
 
 def _suggest_alternatives(conn: sqlite3.Connection, base: str, n: int = 3) -> list[str]:
@@ -1079,7 +1145,8 @@ def register(
             if existing:
                 conn.execute(
                     "UPDATE agents SET working_on = ?, last_seen_ms = ?, "
-                    "token_hash = ?, reclaim_hash = ?, session_id = ? WHERE name = ?",
+                    "token_hash = ?, reclaim_hash = ?, session_id = ?, "
+                    "monitor_heartbeat_ms = NULL, receipts_opt_out = 0 WHERE name = ?",
                     (working_on, now_ms, token_hash(token), token_hash(reclaim_secret), sid, name),
                 )
             else:
@@ -1253,7 +1320,7 @@ def list_threads(active_within: timedelta = timedelta(hours=24)) -> list[AgentSu
 
             now_ms = _now_ms()
             cutoff_ms = now_ms - int(active_within.total_seconds() * 1000)
-            wake_cutoff_ms = now_ms - wake_window_seconds() * 1000
+
             # unread_count is ACTIONABLE mail only: receipts are counted apart,
             # and cancelled / superseded / past-deadline messages not at all, so
             # a coordinator never mistakes noise or withdrawn work for a backlog.
@@ -1297,7 +1364,7 @@ def list_threads(active_within: timedelta = timedelta(hours=24)) -> list[AgentSu
                         stale=last_seen_ms < cutoff_ms,
                         status=r["status"] if "status" in keys else None,
                         status_detail=r["status_detail"] if "status_detail" in keys else None,
-                        wakeable=hb_ms is not None and hb_ms >= wake_cutoff_ms,
+                        wakeable=_is_wakeable(hb_ms, now_ms),
                         monitor_heartbeat=_ms_to_dt(hb_ms),
                         unread_receipts=r["unread_receipts"],
                     )
@@ -1385,6 +1452,11 @@ def send(
         or expires_in_seconds <= 0
     ):
         raise DLBError("expires_in_seconds must be a positive integer")
+    if expires_in_seconds is not None and expires_in_seconds > ttl_days() * 24 * 60 * 60:
+        raise DLBError(
+            f"expires_in_seconds={expires_in_seconds} exceeds the message TTL "
+            f"({ttl_days()} days); a deadline past the purge would never fire"
+        )
     if not to or not isinstance(to, str):
         raise DLBError("to must be a non-empty string")
     if not body or not isinstance(body, str):
@@ -1443,6 +1515,16 @@ def send(
 
             if supersedes is not None:
                 old = _load_withdrawable(conn, supersedes, sender)
+                if old["cancelled_at_ms"] is not None:
+                    raise DLBError(
+                        f"message #{supersedes} is already withdrawn "
+                        f"({old['cancel_reason'] or 'cancelled'}); nothing to supersede"
+                    )
+                if old["recipient_name"] != to:
+                    raise DLBError(
+                        f"message #{supersedes} was sent to {old['recipient_name']!r}, "
+                        f"not {to!r}; a replacement must go to the same recipient"
+                    )
 
             cur = conn.execute(
                 "INSERT INTO messages (recipient_name, sender_name, subject, body, "
@@ -1463,8 +1545,9 @@ def send(
                 ),
             )
             msg_id = cur.lastrowid
+            notice_id: int | None = None
             if supersedes is not None:
-                _withdraw(
+                _, notice_id = _withdraw(
                     conn,
                     old,
                     reason=f"superseded by #{msg_id}",
@@ -1474,7 +1557,7 @@ def send(
             # Ring-buffer the recipient's inbox (drop oldest beyond the cap).
             # Runs inside this txn so the message just inserted is never the one
             # dropped. No-op when DLB_MAX_INBOX <= 0.
-            _enforce_inbox_cap(conn, to)
+            _enforce_inbox_cap(conn, to, exempt_ids=(msg_id, notice_id))  # type: ignore[arg-type]
             conn.execute("COMMIT")
         except Exception:
             with suppress(sqlite3.OperationalError):
@@ -1494,6 +1577,7 @@ def send(
         in_reply_to=in_reply_to,
         headline=headline,
         deadline=_ms_to_dt(deadline_ms),
+        supersedes=supersedes,
     )
 
 
@@ -1508,6 +1592,11 @@ def _load_withdrawable(conn: sqlite3.Connection, message_id: int, caller: str) -
     row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
     if row is None:
         raise DLBError(f"message #{message_id} not found (never sent, or purged)")
+    if (row["msg_type"] or "") in ("cancel", "receipt"):
+        raise DLBError(
+            f"message #{message_id} is a system {row['msg_type']} notice, not work; "
+            "it cannot be cancelled or superseded"
+        )
     if not row["authenticated"] or row["sender_name"] != caller:
         raise AuthError(
             f"message #{message_id} can only be withdrawn by its authenticated sender "
@@ -1523,15 +1612,19 @@ def _withdraw(
     reason: str | None,
     superseded_by: int | None,
     now_ms: int,
-) -> bool:
-    """Mark `row` cancelled (and optionally superseded). Returns True if this
-    call changed it; False if it was already withdrawn (idempotent).
+) -> tuple[bool, int | None]:
+    """Mark `row` cancelled (and optionally superseded).
+
+    Returns (changed, notice_id): changed is False if it was already withdrawn
+    (idempotent); notice_id is the id of the cancel notice dropped to the
+    recipient, or None. The caller enforces the inbox cap, exempting the
+    notice, so a trim can never delete the notice it just wrote.
 
     If the recipient had ALREADY read the message, hiding it is not enough:
     they may be working on it. Drop a msg_type='cancel' notice so they stop.
     """
     if row["cancelled_at_ms"] is not None:
-        return False
+        return False, None
     conn.execute(
         "UPDATE messages SET cancelled_at_ms = ?, cancel_reason = ?, superseded_by = ? "
         "WHERE id = ?",
@@ -1539,7 +1632,7 @@ def _withdraw(
     )
     if row["read_at_ms"] is not None:
         verb = f"superseded by #{superseded_by}" if superseded_by else "cancelled"
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO messages (recipient_name, sender_name, subject, body, sent_at_ms, "
             "read_at_ms, expires_at_ms, msg_type, in_reply_to, headline, authenticated) "
             "VALUES (?, ?, ?, ?, ?, NULL, ?, 'cancel', ?, ?, 1)",
@@ -1555,8 +1648,8 @@ def _withdraw(
                 f"cancel #{row['id']}",
             ),
         )
-        _enforce_inbox_cap(conn, row["recipient_name"])
-    return True
+        return True, cur.lastrowid
+    return True, None
 
 
 def _token_name(conn: sqlite3.Connection, session_token: str) -> str:
@@ -1582,7 +1675,11 @@ def cancel_task(message_id: int, session_token: str, reason: str | None = None) 
         try:
             caller = _token_name(conn, session_token)
             row = _load_withdrawable(conn, message_id, caller)
-            changed = _withdraw(conn, row, reason=reason, superseded_by=None, now_ms=_now_ms())
+            changed, notice_id = _withdraw(
+                conn, row, reason=reason, superseded_by=None, now_ms=_now_ms()
+            )
+            if notice_id is not None:
+                _enforce_inbox_cap(conn, row["recipient_name"], exempt_ids=(notice_id,))
             conn.execute("COMMIT")
         except Exception:
             with suppress(sqlite3.OperationalError):
@@ -1632,7 +1729,8 @@ def update_status(
         conn.execute("BEGIN IMMEDIATE")
         try:
             msg_row = conn.execute(
-                "SELECT recipient_name, read_at_ms FROM messages WHERE id = ?",
+                "SELECT recipient_name, read_at_ms, cancelled_at_ms, deadline_ms "
+                "FROM messages WHERE id = ?",
                 (message_id,),
             ).fetchone()
             if msg_row is None:
@@ -1652,6 +1750,15 @@ def update_status(
             if not _auth_ok(session_token, agent["token_hash"]):
                 conn.execute("ROLLBACK")
                 raise AuthError("Invalid session_token for this message's recipient.")
+            if msg_row["cancelled_at_ms"] is not None:
+                conn.execute("ROLLBACK")
+                raise DLBError(
+                    f"message #{message_id} was withdrawn by its sender; stop work on it "
+                    "(get_task_status shows why)"
+                )
+            if msg_row["deadline_ms"] is not None and msg_row["deadline_ms"] <= now_ms:
+                conn.execute("ROLLBACK")
+                raise DLBError(f"message #{message_id} is past its deadline; it is no longer work")
 
             # Set read_at_ms if it was still NULL (status update implies read)
             new_read_at_ms = msg_row["read_at_ms"] or now_ms
@@ -1691,7 +1798,8 @@ def get_task_status(message_id: int) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
             "SELECT id, msg_type, in_reply_to, status, status_note, "
-            "status_updated_at_ms, read_at_ms "
+            "status_updated_at_ms, read_at_ms, cancelled_at_ms, cancel_reason, "
+            "superseded_by, deadline_ms "
             "FROM messages WHERE id = ?",
             (message_id,),
         ).fetchone()
@@ -1699,6 +1807,16 @@ def get_task_status(message_id: int) -> dict | None:
         return None
     read_at = _ms_to_dt(row["read_at_ms"])
     status_updated_at = _ms_to_dt(row["status_updated_at_ms"])
+    cancelled_at = _ms_to_dt(row["cancelled_at_ms"])
+    deadline = _ms_to_dt(row["deadline_ms"])
+    if row["superseded_by"] is not None:
+        lifecycle: str | None = "superseded"
+    elif row["cancelled_at_ms"] is not None:
+        lifecycle = "cancelled"
+    elif row["deadline_ms"] is not None and row["deadline_ms"] <= _now_ms():
+        lifecycle = "expired"
+    else:
+        lifecycle = None
     # A lightweight, auth-free status probe. It deliberately does NOT return
     # recipient_name/sender_name (the docstring never promised them): keeping the
     # auth-free surface to pure lifecycle status shrinks the enumeration-harvest
@@ -1711,6 +1829,11 @@ def get_task_status(message_id: int) -> dict | None:
         "status_note": row["status_note"],
         "status_updated_at": status_updated_at.isoformat() if status_updated_at else None,
         "read_at": read_at.isoformat() if read_at else None,
+        "cancelled_at": cancelled_at.isoformat() if cancelled_at else None,
+        "cancel_reason": row["cancel_reason"],
+        "superseded_by": row["superseded_by"],
+        "deadline": deadline.isoformat() if deadline else None,
+        "lifecycle": lifecycle,
     }
 
 
@@ -1814,7 +1937,16 @@ def read(
             # for whoever eventually claims the name. Capture the exact ms value
             # we write so the returned objects' read_at matches the DB to the
             # millisecond (avoids a "stored vs. returned" drift bug).
-            ids = [r["id"] for r in rows if r["read_at_ms"] is None]
+            # Inactive rows (shown only with include_inactive) are not work, so
+            # they are never marked read and never generate receipts.
+            now_sel = _now_ms()
+            ids = [
+                r["id"]
+                for r in rows
+                if r["read_at_ms"] is None
+                and r["cancelled_at_ms"] is None
+                and (r["deadline_ms"] is None or r["deadline_ms"] > now_sel)
+            ]
             mark_read_ms: int | None = None
             if ids and is_owner:
                 mark_read_ms = _now_ms()
@@ -1989,7 +2121,39 @@ def _require_auth(conn: sqlite3.Connection, name: str, session_token: str, actio
         raise AuthError(f"Invalid session_token for '{name}'.")
 
 
-def record_monitor_heartbeat(name: str) -> bool:
+def _heartbeat_auth(
+    conn: sqlite3.Connection, name: str, session_token: str | None, session_id: str | None
+) -> bool:
+    """Gate monitor heartbeats. Returns False if `name` is unregistered.
+
+    A heartbeat is a promise that this session will be woken, so it must come
+    from the session that owns the name: either its session_token, or the same
+    harness session id it registered under. Without this a monitor started on a
+    typo'd or someone else's name marks that agent `wakeable` when nothing is
+    watching it.
+    """
+    row = conn.execute(
+        "SELECT token_hash, session_id FROM agents WHERE name = ?", (name,)
+    ).fetchone()
+    if row is None:
+        return False
+    if session_token is not None:
+        if not _auth_ok(session_token, row["token_hash"]):
+            raise AuthError(f"Invalid session_token for '{name}'.")
+        return True
+    sid = session_id if session_id is not None else current_session_id()
+    if not sid or row["session_id"] is None or row["session_id"] != sid:
+        raise AuthError(
+            f"monitor heartbeat for '{name}' refused: pass its session_token, or run "
+            "in the harness session that registered it (DLB_SESSION_ID / "
+            "CLAUDE_CODE_SESSION_ID must match)."
+        )
+    return True
+
+
+def record_monitor_heartbeat(
+    name: str, session_token: str | None = None, *, session_id: str | None = None
+) -> bool:
     """Mark that a live wake source (dlb-monitor) is watching `name`'s inbox.
 
     Called by dlb-monitor on its poll loop. Deliberately separate from
@@ -1997,15 +2161,32 @@ def record_monitor_heartbeat(name: str) -> bool:
     says something WILL wake it when mail arrives. list_threads turns this into
     `wakeable`, and send() reports it back to the sender.
 
-    No token: the monitor is a separate process that only watches the store.
-    Same trust boundary as the rest of DLB (cooperating agents, one OS user).
-    Returns False if `name` is not registered (nothing to mark).
+    Auth (see _heartbeat_auth): the name's session_token, or the harness
+    session id it registered under (defaults to this process's
+    DLB_SESSION_ID). Raises AuthError on a mismatch. Returns False if `name`
+    is not registered (nothing to mark).
     """
     init_schema()
     with _connect() as conn:
+        if not _heartbeat_auth(conn, name, session_token, session_id):
+            return False
         cur = conn.execute(
             "UPDATE agents SET monitor_heartbeat_ms = ? WHERE name = ?", (_now_ms(), name)
         )
+        return cur.rowcount > 0
+
+
+def clear_monitor_heartbeat(
+    name: str, session_token: str | None = None, *, session_id: str | None = None
+) -> bool:
+    """Withdraw the wake promise: dlb-monitor calls this on exit so `name`
+    stops reading as wakeable at once, not a whole wake window later. Same
+    auth as record_monitor_heartbeat."""
+    init_schema()
+    with _connect() as conn:
+        if not _heartbeat_auth(conn, name, session_token, session_id):
+            return False
+        cur = conn.execute("UPDATE agents SET monitor_heartbeat_ms = NULL WHERE name = ?", (name,))
         return cur.rowcount > 0
 
 
@@ -2089,7 +2270,9 @@ def claim(
             if row is not None and row["holder"] != name and row["expires_at_ms"] > now_ms:
                 conn.execute("COMMIT")
                 return {"claimed": False, **_claim_dict(row)}
-            renewed = row is not None and row["holder"] == name
+            renewed = row is not None and row["holder"] == name and row["expires_at_ms"] > now_ms
+            # Renewing without a note keeps the old one; a fresh claim takes `note`.
+            note_val = row["note"] if renewed and note is None else note
             took_over_from = row["holder"] if row is not None and not renewed else None
             claimed_at_ms = row["claimed_at_ms"] if renewed else now_ms
             conn.execute(
@@ -2097,7 +2280,7 @@ def claim(
                 "VALUES (?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET holder = excluded.holder, "
                 "claimed_at_ms = excluded.claimed_at_ms, expires_at_ms = excluded.expires_at_ms, "
                 "note = excluded.note",
-                (key, name, claimed_at_ms, now_ms + ttl_seconds * 1000, note),
+                (key, name, claimed_at_ms, now_ms + ttl_seconds * 1000, note_val),
             )
             new_row = conn.execute("SELECT * FROM claims WHERE key = ?", (key,)).fetchone()
             conn.execute("COMMIT")
@@ -2138,23 +2321,21 @@ def list_claims(prefix: str | None = None) -> list[dict]:
     start with `prefix`. No auth: who holds what is coordination metadata."""
     init_schema()
     _check_field(prefix, "prefix")
+    # Read-only on purpose: an auth-free call must not take the write lock.
+    # Expired rows are filtered here and overwritten by the next claim().
+    now_ms = _now_ms()
     with _connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            now_ms = _now_ms()
-            conn.execute("DELETE FROM claims WHERE expires_at_ms <= ?", (now_ms,))
-            if prefix:
-                rows = conn.execute(
-                    "SELECT * FROM claims WHERE substr(key, 1, ?) = ? ORDER BY claimed_at_ms",
-                    (len(prefix), prefix),
-                ).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM claims ORDER BY claimed_at_ms").fetchall()
-            conn.execute("COMMIT")
-        except Exception:
-            with suppress(sqlite3.OperationalError):
-                conn.execute("ROLLBACK")
-            raise
+        if prefix:
+            rows = conn.execute(
+                "SELECT * FROM claims WHERE expires_at_ms > ? AND substr(key, 1, ?) = ? "
+                "ORDER BY claimed_at_ms",
+                (now_ms, len(prefix), prefix),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM claims WHERE expires_at_ms > ? ORDER BY claimed_at_ms",
+                (now_ms,),
+            ).fetchall()
     return [_claim_dict(r) for r in rows]
 
 
@@ -2189,7 +2370,7 @@ def dispatch_assessment(name: str) -> dict:
     now_ms = _now_ms()
     hb_ms = row["monitor_heartbeat_ms"]
     hb_age = (now_ms - hb_ms) // 1000 if hb_ms is not None else None
-    wakeable = hb_age is not None and hb_age <= wake_window_seconds()
+    wakeable = _is_wakeable(hb_ms, now_ms)
     status = row["status"]
     warnings = []
     if not wakeable:

@@ -24,6 +24,7 @@ import pytest
 from dlb_mcp import store
 from dlb_mcp.monitor import _format_event, _sanitize_line
 from dlb_mcp.store import AuthError, DLBError
+from tests._schema import assert_store_current
 
 # ── Issue 2a: control-character rejection + monitor sink sanitization ─────────
 
@@ -175,8 +176,7 @@ def test_v1_to_v2_migration_sets_user_version_in_txn(tmp_path, monkeypatch) -> N
     conn.close()
 
     store.init_schema()
-    with sqlite3.connect(str(db)) as c:
-        assert c.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
+    assert_store_current(db)
     # Store is usable post-migration and the migrated message survived.
     reg = store.register("alpha", force=True, prior_token="tok")
     msgs = store.read("alpha", session_token=reg["session_token"], unread_only=False)

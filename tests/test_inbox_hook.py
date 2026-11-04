@@ -119,7 +119,7 @@ def test_fresh_heartbeat_clears_warning_and_stale_one_returns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _reg_in_session(monkeypatch, "w", "sess-1")
-    assert store.record_monitor_heartbeat("w")
+    assert store.record_monitor_heartbeat("w", session_id="sess-1")
     assert inbox_hook.unmonitored_names("sess-1") == []
 
     real = store._now_ms()
@@ -140,13 +140,13 @@ def test_unmonitored_tolerates_missing_store_and_pre_v9(monkeypatch: pytest.Monk
 def test_render_warning_alone_and_with_mail() -> None:
     out = json.loads(inbox_hook.render("UserPromptSubmit", [], ["w"]))
     ctx = out["hookSpecificOutput"]["additionalContext"]
-    assert ctx.startswith("⚠ DLB: 'w' is registered from this session")
+    assert ctx.startswith('⚠ DLB: "w" is registered from this session')
     assert '--name w", description: "DLB inbox: w", persistent: true})' in ctx
 
     both = json.loads(inbox_hook.render("UserPromptSubmit", [("w", 1)], ["w"]))
     ctx = both["hookSpecificOutput"]["additionalContext"]
     assert ctx.startswith("📬 DLB inbox status: w (1) unread.")
-    assert "\n\n⚠ DLB: 'w'" in ctx
+    assert '\n\n⚠ DLB: "w"' in ctx
 
 
 def test_main_reads_session_id_from_stdin(
@@ -159,7 +159,7 @@ def test_main_reads_session_id_from_stdin(
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "sess-1"})))
     inbox_hook.main()
     ctx = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
-    assert "'w' is registered from this session" in ctx
+    assert '"w" is registered from this session' in ctx
 
     # Another session's prompt sees nothing about w.
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "sess-2"})))

@@ -15,6 +15,7 @@ import pytest
 
 from dlb_mcp import store
 from dlb_mcp.store import AuthError, DLBError, NameConflict, TakeoverDenied
+from tests._schema import assert_store_current
 
 # ── #1: LIKE-metachar escape ─────────────────────────────────────────────────
 
@@ -126,9 +127,8 @@ def test_v1_schema_migrates_to_v2_on_connect(isolated_store) -> None:
     conn = sqlite3.connect(str(isolated_store))
     conn.row_factory = sqlite3.Row
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    from dlb_mcp.store import SCHEMA_VERSION
-
-    assert version == SCHEMA_VERSION
+    del version
+    assert_store_current(isolated_store)
 
     agent = conn.execute(
         "SELECT registered_at_ms, last_seen_ms FROM agents WHERE name='legacy'"

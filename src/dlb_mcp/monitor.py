@@ -30,9 +30,12 @@ Filters:
                                  (--include and --exclude are mutually
                                  exclusive)
 
-Process model: pure poller. Exits on Ctrl-C (Monitor stops it cleanly
-on session end). All errors are logged to stderr and the loop continues;
-a single SQLite hiccup must not kill the wake source.
+Process model: poller plus an independent heartbeat thread. Exits on
+Ctrl-C, on a closed stdout, or when its parent process goes away, and
+clears its heartbeat on the way out. Messages that are cancelled,
+superseded, or past their deadline never produce an event. All other
+errors are logged to stderr and the loop continues; a single SQLite
+hiccup must not kill the wake source.
 """
 
 from __future__ import annotations
@@ -153,10 +156,18 @@ def _fetch_new(
                 r[1] == "msg_type" for r in conn.execute("PRAGMA table_info(messages)")
             )
             mtcol = "msg_type" if has_msg_type else "NULL AS msg_type"
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+            # v9+: never wake on a message that was cancelled, superseded, or
+            # is already past its deadline. Older stores lack the columns.
+            active = ""
+            params: tuple[object, ...] = (recipient, since_id)
+            if {"cancelled_at_ms", "deadline_ms"} <= cols:
+                active = " AND cancelled_at_ms IS NULL AND (deadline_ms IS NULL OR deadline_ms > ?)"
+                params = (recipient, since_id, int(time.time() * 1000))
             rows = conn.execute(
                 f"SELECT id, sent_at_ms, sender_name, subject, body, {col}, {mtcol} FROM messages "
-                "WHERE recipient_name = ? AND id > ? ORDER BY id ASC",
-                (recipient, since_id),
+                f"WHERE recipient_name = ? AND id > ?{active} ORDER BY id ASC",
+                params,
             ).fetchall()
             return [(int(r[0]), int(r[1]), r[2], r[3], r[4], r[5], r[6]) for r in rows]
         finally:
@@ -172,13 +183,58 @@ def _fetch_new(
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
-def _heartbeat(name: str) -> None:
+def _heartbeat(name: str, token: str | None = None, session_id: str | None = None) -> None:
     """Record a monitor heartbeat. Never raises: a failed beat only means
-    senders briefly see `wakeable=False`, which must not kill the wake source."""
+    senders briefly see `wakeable=False`, which must not kill the wake source.
+
+    Auth: the store accepts either the name's session_token or a matching
+    session id (see store._heartbeat_auth)."""
     try:
-        store.record_monitor_heartbeat(name)
+        store.record_monitor_heartbeat(name, token, session_id=session_id)
     except Exception as e:
         print(f"dlb-monitor: warning: heartbeat failed: {e}", file=sys.stderr)
+
+
+def _clear_heartbeat(name: str, token: str | None = None, session_id: str | None = None) -> None:
+    """Drop this monitor's heartbeat on exit so senders stop seeing the name as
+    wakeable the moment the wake source goes away. Never raises."""
+    try:
+        store.clear_monitor_heartbeat(name, token, session_id=session_id)
+    except Exception as e:
+        print(f"dlb-monitor: warning: heartbeat clear failed: {e}", file=sys.stderr)
+
+
+class _HeartbeatThread(threading.Thread):
+    """Beats on its own timer, independent of the poll loop, so a slow or
+    backed-off poll tick can never let the heartbeat go stale."""
+
+    def __init__(
+        self,
+        name: str,
+        token: str | None,
+        interval: float,
+        session_id: str | None = None,
+    ) -> None:
+        super().__init__(daemon=True, name="dlb-monitor-heartbeat")
+        self._dlb_name = name
+        self._token = token
+        self._session_id = session_id
+        self._interval = interval
+        self.stop = threading.Event()
+
+    def run(self) -> None:
+        while not self.stop.is_set():
+            _heartbeat(self._dlb_name, self._token, self._session_id)
+            self.stop.wait(self._interval)
+
+
+def _session_id() -> str | None:
+    """The session id to authenticate heartbeats with. A monitor launched by
+    Claude Code inherits CLAUDE_CODE_SESSION_ID but not necessarily
+    DLB_SESSION_ID, so fall back to it; session-based heartbeat auth then works
+    without the monitor ever holding a token. Read-only: the process env is not
+    modified."""
+    return os.environ.get("DLB_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
 
 
 def _poll_iteration(
@@ -219,6 +275,7 @@ def run(
     exclude_senders: set[str] | None,
     emit_receipts: bool = False,
     stop_event: threading.Event | None = None,
+    session_token: str | None = None,
 ) -> int:
     """Main poll loop. Returns exit code (0 on clean Ctrl-C / stop).
 
@@ -237,8 +294,15 @@ def run(
     instead of leaking an unkillable daemon. `main()` (the CLI path) passes
     no event, so the default behavior (infinite loop until Ctrl-C/SIGKILL)
     is unchanged.
+
+    Exit paths beyond Ctrl-C/stop: a closed stdout (EPIPE: the Monitor task is
+    gone) or a changed parent pid (the launching session died and we were
+    reparented) both end the loop, so an orphaned monitor can't keep the name
+    looking wakeable. Every exit clears this monitor's heartbeat.
     """
+    session_id = _session_id()
     db_path = store.store_path()
+    start_ppid = os.getppid()
     # init_schema runs migration on a legacy v1 DB so we can read *_ms
     # safely. Safe to call here; it's idempotent.
     try:
@@ -264,14 +328,14 @@ def run(
         time.sleep(seconds)
         return False
 
-    last_beat = float("-inf")
+    beater = _HeartbeatThread(name, session_token, HEARTBEAT_INTERVAL_SECONDS, session_id)
+    beater.start()
     try:
         while stop_event is None or not stop_event.is_set():
             try:
-                now = time.monotonic()
-                if now - last_beat >= HEARTBEAT_INTERVAL_SECONDS:
-                    _heartbeat(name)
-                    last_beat = now
+                if os.getppid() != start_ppid:
+                    print("dlb-monitor: stopping (parent process exited)", file=sys.stderr)
+                    return 0
                 seen_max_id = _poll_iteration(
                     db_path,
                     name,
@@ -284,6 +348,16 @@ def run(
                     break
             except KeyboardInterrupt:
                 raise  # forwarded to the outer handler for clean exit
+            except BrokenPipeError:
+                # Nobody is reading our events any more. Point stdout at
+                # devnull so interpreter shutdown doesn't raise again on flush.
+                try:
+                    devnull = os.open(os.devnull, os.O_WRONLY)
+                    os.dup2(devnull, sys.stdout.fileno())
+                except OSError:
+                    pass
+                print("dlb-monitor: stopping (stdout closed)", file=sys.stderr)
+                return 0
             except Exception as e:
                 # Hard guarantee: a non-fatal error in one iteration must not
                 # take down the wake source. Log loud enough that the user
@@ -306,6 +380,10 @@ def run(
     except KeyboardInterrupt:
         print("dlb-monitor: stopping (KeyboardInterrupt)", file=sys.stderr)
         return 0
+    finally:
+        beater.stop.set()
+        beater.join(timeout=5.0)
+        _clear_heartbeat(name, session_token, session_id)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -348,6 +426,16 @@ def main(argv: list[str] | None = None) -> int:
             "still sit in the inbox to be read)."
         ),
     )
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("DLB_MONITOR_TOKEN") or None,
+        help=(
+            "session_token for --name, used to authenticate heartbeats "
+            "(default: DLB_MONITOR_TOKEN). Optional when the monitor runs in "
+            "the same session that registered the name (DLB_SESSION_ID or "
+            "CLAUDE_CODE_SESSION_ID)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.include_senders and args.exclude_senders:
@@ -373,6 +461,7 @@ def main(argv: list[str] | None = None) -> int:
         include_senders=include,
         exclude_senders=exclude,
         emit_receipts=args.emit_receipts,
+        session_token=args.token,
     )
 
 

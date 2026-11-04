@@ -232,12 +232,12 @@ def test_claim_race_has_exactly_one_winner() -> None:
 
 
 def test_heartbeat_makes_agent_wakeable(monkeypatch: pytest.MonkeyPatch) -> None:
-    _reg("worker")
+    w = _reg("worker")
     assert store.record_monitor_heartbeat("ghost") is False
     summary = {s.name: s for s in store.list_threads()}["worker"]
     assert summary.wakeable is False
 
-    assert store.record_monitor_heartbeat("worker") is True
+    assert store.record_monitor_heartbeat("worker", w) is True
     summary = {s.name: s for s in store.list_threads()}["worker"]
     assert summary.wakeable is True
     assert store.dispatch_assessment("worker")["wakeable"] is True
@@ -286,7 +286,7 @@ def test_dispatch_assessment_warnings() -> None:
     assert idle["registered"] is True
     assert "no live dlb-monitor" in idle["warning"]
 
-    store.record_monitor_heartbeat("worker")
+    store.record_monitor_heartbeat("worker", w)
     assert store.dispatch_assessment("worker")["warning"] is None
 
     store.set_status("worker", w, "done", "shipped PR")

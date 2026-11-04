@@ -19,6 +19,7 @@ import pytest
 
 from dlb_mcp import store
 from dlb_mcp.store import DLBError
+from tests._schema import assert_store_current
 
 
 def _build_v5_store(path: Path, n_agents: int = 3) -> None:
@@ -91,8 +92,7 @@ def test_concurrent_init_schema_has_no_unhandled_errors(tmp_path: Path) -> None:
     results = [q.get(timeout=5) for _ in range(n)]
     errs = [m for (s, m) in results if s == "err"]
     assert not errs, f"concurrent migration raised: {errs}"
-    with sqlite3.connect(str(dbp)) as c:
-        assert c.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
+    assert_store_current(dbp)
 
 
 def test_crashed_fresh_init_self_heals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -105,8 +105,7 @@ def test_crashed_fresh_init_self_heals(tmp_path: Path, monkeypatch: pytest.Monke
     with sqlite3.connect(str(dbp)) as c:
         c.execute("PRAGMA user_version = 0")  # simulate the crash gap
     store.init_schema()  # must not raise / brick
-    with sqlite3.connect(str(dbp)) as c:
-        assert c.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
+    assert_store_current(dbp)
     # And the store is usable.
     reg = store.register("alpha")
     assert store.read("alpha", session_token=reg["session_token"]) == []
@@ -126,11 +125,12 @@ def test_v8_store_migrates_to_v9(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
             c.execute(f"ALTER TABLE messages DROP COLUMN {col}")
         for col in ("monitor_heartbeat_ms", "receipts_opt_out"):
             c.execute(f"ALTER TABLE agents DROP COLUMN {col}")
+        c.execute("DROP TABLE dlb_meta")
         c.execute("PRAGMA user_version = 8")
 
     store.init_schema()
     with sqlite3.connect(str(dbp)) as c:
-        assert c.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
+        assert_store_current(dbp)
         msg_cols = {r[1] for r in c.execute("PRAGMA table_info(messages)")}
         agent_cols = {r[1] for r in c.execute("PRAGMA table_info(agents)")}
         assert {"cancelled_at_ms", "cancel_reason", "superseded_by", "deadline_ms"} <= msg_cols
@@ -139,9 +139,39 @@ def test_v8_store_migrates_to_v9(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
     assert [m.id for m in store.read("alpha", tok)] == [old.id]
     assert store.claim("k", "alpha", tok)["claimed"] is True
-    assert store.record_monitor_heartbeat("alpha") is True
+    assert store.record_monitor_heartbeat("alpha", tok) is True
     # Re-running on an already-current store is a no-op.
     store.init_schema()
+
+
+def test_dev_v9_store_without_meta_is_restamped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store built by a pre-release v9 build (user_version=9, no dlb_meta)
+    must migrate idempotently and be re-stamped to the min-reader version, so a
+    0.6.x server sharing it stops refusing it as 'newer'."""
+    dbp = tmp_path / "store.sqlite3"
+    monkeypatch.setenv("DLB_STORE", str(dbp))
+    store.init_schema()
+    tok = store.register("alpha")["session_token"]
+    with sqlite3.connect(str(dbp)) as c:
+        c.execute("DROP TABLE dlb_meta")
+        c.execute(f"PRAGMA user_version = {store.SCHEMA_VERSION}")
+    store.init_schema()
+    assert_store_current(dbp)
+    assert store.read("alpha", tok) == []
+
+
+def test_min_reader_stamp_lets_v8_builds_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rollout guarantee: a v8 build refuses only user_version > 8. After a
+    v9 upgrade the store must still pass that check."""
+    dbp = tmp_path / "store.sqlite3"
+    monkeypatch.setenv("DLB_STORE", str(dbp))
+    store.init_schema()
+    with sqlite3.connect(str(dbp)) as c:
+        assert c.execute("PRAGMA user_version").fetchone()[0] <= 8
 
 
 def test_store_newer_than_code_raises_clear_error(
@@ -185,7 +215,7 @@ def test_v1_duplicate_names_migrate_without_bricking(
     c.close()
     store.init_schema()  # must not raise IntegrityError
     with sqlite3.connect(str(dbp)) as c:
-        assert c.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
+        assert_store_current(dbp)
         assert c.execute("SELECT count(*) FROM agents WHERE name='dup'").fetchone()[0] == 1
 
 
@@ -205,7 +235,7 @@ def test_concurrent_upgrade_to_newer_raises_forward_compat(
     monkeypatch.setenv("DLB_STORE", str(dbp))
     store.init_schema()  # build a valid current store (WAL)
     with sqlite3.connect(str(dbp)) as c:
-        c.execute(f"PRAGMA user_version = {store.SCHEMA_VERSION - 1}")  # look "older"
+        c.execute("DELETE FROM dlb_meta")  # look "older": no applied-schema record
     newer = store.SCHEMA_VERSION + 1
 
     def hold_and_bump() -> None:

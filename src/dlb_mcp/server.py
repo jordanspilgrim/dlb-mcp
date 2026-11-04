@@ -119,6 +119,8 @@ def _message_dict(m: store.Message) -> dict[str, Any]:
         d["cancelled_at"] = m.cancelled_at.isoformat()
     if m.cancel_reason is not None:
         d["cancel_reason"] = m.cancel_reason
+    if m.supersedes is not None:
+        d["supersedes"] = m.supersedes
     if m.superseded_by is not None:
         d["superseded_by"] = m.superseded_by
     lifecycle = m.lifecycle
