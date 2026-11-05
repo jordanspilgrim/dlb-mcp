@@ -204,6 +204,42 @@ def test_has_command_matches_uvx_form() -> None:
     assert not setup._has_command(settings, "SessionStart", "dlb-session-recover")
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "dlb-session-recover  # print registered names after compaction",
+        "/Users/x/.local/bin/dlb-session-recover #recover",
+        "uvx --from dlb-mcp dlb-session-recover # via uvx",
+    ],
+)
+def test_has_command_ignores_trailing_comment(cmd: str) -> None:
+    settings = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": cmd}]}]}}
+    assert setup._has_command(settings, "SessionStart", "dlb-session-recover")
+
+
+def test_has_command_survives_unbalanced_quotes() -> None:
+    settings = {
+        "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo 'oops"}]}]}
+    }
+    assert not setup._has_command(settings, "SessionStart", "dlb-session-recover")
+
+
+def test_setup_does_not_duplicate_commented_hooks(tmp_path: Path) -> None:
+    # Every required hook already wired, each with a trailing comment: setup
+    # must see them all and leave the file alone.
+    hooks: dict[str, list] = {}
+    for event, command in setup.REQUIRED_HOOKS:
+        hooks.setdefault(event, []).append(
+            {"hooks": [{"type": "command", "command": f"{command}  # wired by hand"}]}
+        )
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"hooks": hooks}))
+    before = path.read_text()
+    changed, message = setup.wire_session_hook(path)
+    assert not changed, message
+    assert path.read_text() == before
+
+
 # --- heartbeat auth ----------------------------------------------------------
 
 

@@ -25,6 +25,7 @@ Design rules:
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 from pathlib import Path
 
@@ -82,6 +83,16 @@ def _strip_uvx(argv: list[str]) -> list[str]:
     return rest if name == UVX_FROM else argv
 
 
+def _argv(cmd: str) -> list[str]:
+    """Split a hook command the way the shell would, dropping a trailing
+    ``# comment`` so an annotated hook still matches. Unbalanced quotes fall
+    back to a plain whitespace split rather than raising."""
+    try:
+        return shlex.split(cmd, comments=True)
+    except ValueError:
+        return cmd.split()
+
+
 def _has_command(settings: dict, event: str, command: str) -> bool:
     """True if `command` is wired for `event`. Matches the command itself (an
     absolute path to the same console script counts, as does the
@@ -89,7 +100,7 @@ def _has_command(settings: dict, event: str, command: str) -> bool:
     ``dlb-inbox-check.sh`` is never mistaken for the real hook."""
     want = command.split()
     for cmd in _commands(settings, event):
-        have = _strip_uvx(cmd.split())
+        have = _strip_uvx(_argv(cmd))
         if have and have[0].rsplit("/", 1)[-1] == want[0] and have[1:] == want[1:]:
             return True
     return False
