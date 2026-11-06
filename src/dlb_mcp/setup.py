@@ -25,6 +25,7 @@ Design rules:
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 from pathlib import Path
 
@@ -82,6 +83,38 @@ def _strip_uvx(argv: list[str]) -> list[str]:
     return rest if name == UVX_FROM else argv
 
 
+def _strip_comment(cmd: str) -> str:
+    """Drop a shell comment from `cmd`. As in the shell, ``#`` starts a
+    comment only at the start of a word (line start or after whitespace) and
+    outside quotes, so ``dlb-session-recover#disabled`` stays one word."""
+    quote = ""
+    escaped = False
+    for i, ch in enumerate(cmd):
+        if escaped:
+            escaped = False
+        elif ch == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (i == 0 or cmd[i - 1].isspace()):
+            return cmd[:i]
+    return cmd
+
+
+def _argv(cmd: str) -> list[str]:
+    """Split a hook command the way the shell would, dropping a trailing
+    ``# comment`` so an annotated hook still matches. Unbalanced quotes fall
+    back to a plain whitespace split rather than raising."""
+    cmd = _strip_comment(cmd)
+    try:
+        return shlex.split(cmd)
+    except ValueError:
+        return cmd.split()
+
+
 def _has_command(settings: dict, event: str, command: str) -> bool:
     """True if `command` is wired for `event`. Matches the command itself (an
     absolute path to the same console script counts, as does the
@@ -89,7 +122,7 @@ def _has_command(settings: dict, event: str, command: str) -> bool:
     ``dlb-inbox-check.sh`` is never mistaken for the real hook."""
     want = command.split()
     for cmd in _commands(settings, event):
-        have = _strip_uvx(cmd.split())
+        have = _strip_uvx(_argv(cmd))
         if have and have[0].rsplit("/", 1)[-1] == want[0] and have[1:] == want[1:]:
             return True
     return False
