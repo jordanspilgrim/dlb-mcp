@@ -217,6 +217,20 @@ def test_has_command_ignores_trailing_comment(cmd: str) -> None:
     assert setup._has_command(settings, "SessionStart", "dlb-session-recover")
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "dlb-session-recover#disabled",
+        "dlb-session-recover '# not a comment'",
+        "dlb-session-recover \\#literal",
+    ],
+)
+def test_has_command_keeps_hash_inside_a_word(cmd: str) -> None:
+    # A # that does not start a word is part of the command, not a comment.
+    settings = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": cmd}]}]}}
+    assert not setup._has_command(settings, "SessionStart", "dlb-session-recover")
+
+
 def test_has_command_survives_unbalanced_quotes() -> None:
     settings = {
         "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo 'oops"}]}]}

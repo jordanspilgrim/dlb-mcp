@@ -83,12 +83,34 @@ def _strip_uvx(argv: list[str]) -> list[str]:
     return rest if name == UVX_FROM else argv
 
 
+def _strip_comment(cmd: str) -> str:
+    """Drop a shell comment from `cmd`. As in the shell, ``#`` starts a
+    comment only at the start of a word (line start or after whitespace) and
+    outside quotes, so ``dlb-session-recover#disabled`` stays one word."""
+    quote = ""
+    escaped = False
+    for i, ch in enumerate(cmd):
+        if escaped:
+            escaped = False
+        elif ch == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (i == 0 or cmd[i - 1].isspace()):
+            return cmd[:i]
+    return cmd
+
+
 def _argv(cmd: str) -> list[str]:
     """Split a hook command the way the shell would, dropping a trailing
     ``# comment`` so an annotated hook still matches. Unbalanced quotes fall
     back to a plain whitespace split rather than raising."""
+    cmd = _strip_comment(cmd)
     try:
-        return shlex.split(cmd, comments=True)
+        return shlex.split(cmd)
     except ValueError:
         return cmd.split()
 
