@@ -112,6 +112,16 @@ def test_list_threads_no_sentinel_when_current() -> None:
     assert all("stale_server" not in e for e in out)
 
 
+def test_register_rejects_reserved_sentinel_name() -> None:
+    from dlb_mcp import server
+
+    with pytest.raises(store.DLBError, match="reserved"):
+        store.register(store.STALE_SERVER_SENTINEL)
+    with pytest.raises(store.DLBError, match="reserved"):
+        server.register(server.STALE_SERVER_SENTINEL)
+    assert server.list_threads() == []
+
+
 def test_list_threads_sentinel_survives_only_unread(monkeypatch: pytest.MonkeyPatch) -> None:
     from dlb_mcp import server
 

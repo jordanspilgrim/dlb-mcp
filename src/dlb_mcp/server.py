@@ -19,8 +19,9 @@ from . import _version, store
 
 # Name of the entry list_threads appends when this server is older than the
 # dlb-mcp installed on disk. The entry carries a "stale_server" key and none of
-# the usual agent fields, so callers can tell it apart from a real agent.
-STALE_SERVER_SENTINEL = "__dlb_server__"
+# the usual agent fields, and register refuses the name, so callers can tell it
+# apart from a real agent.
+STALE_SERVER_SENTINEL = store.STALE_SERVER_SENTINEL
 
 mcp = FastMCP(
     name="dlb",
