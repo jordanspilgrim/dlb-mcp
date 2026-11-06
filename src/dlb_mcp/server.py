@@ -15,7 +15,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from . import store
+from . import _version, store
 
 mcp = FastMCP(
     name="dlb",
@@ -454,6 +454,10 @@ def send(
     recipient session will not wake for it; tell the user, or pick an active
     recipient, instead of waiting.
 
+    `delivery.stale_server` is about THIS session, not the recipient: null
+    when this server's code matches what is installed, else a notice that
+    dlb-mcp was upgraded on disk and this session must restart to load it.
+
     Read-receipts (v0.3.2+): when the recipient reads a message you sent with
     msg_type='task' (and you sent it under a registered name), DLB drops a
     lightweight msg_type='receipt' back into YOUR inbox so you learn it was
@@ -482,6 +486,9 @@ def send(
     )
     d = _message_dict(msg)
     d["delivery"] = store.dispatch_assessment(to)
+    # About THIS (sending) session, not the recipient: None when the server
+    # process runs the installed dlb-mcp, else a restart notice.
+    d["delivery"]["stale_server"] = _version.stale_server_notice()
     return d
 
 

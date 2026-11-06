@@ -32,7 +32,8 @@ Filters:
 
 Process model: poller plus an independent heartbeat thread. Exits on
 Ctrl-C, on a closed stdout, or when its parent process goes away, and
-clears its heartbeat on the way out. Messages that are cancelled,
+clears its heartbeat on the way out. When dlb-mcp is upgraded on disk it
+exits with code 75 so a supervisor can respawn it on the new code. Messages that are cancelled,
 superseded, or past their deadline never produce an event. All other
 errors are logged to stderr and the loop continues; a single SQLite
 hiccup must not kill the wake source.
@@ -50,7 +51,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import store
+from . import _version, store
 
 DEFAULT_INTERVAL_SECONDS = 2.0
 DEFAULT_BODY_PREVIEW_LEN = 80
@@ -298,7 +299,10 @@ def run(
     Exit paths beyond Ctrl-C/stop: a closed stdout (EPIPE: the Monitor task is
     gone) or a changed parent pid (the launching session died and we were
     reparented) both end the loop, so an orphaned monitor can't keep the name
-    looking wakeable. Every exit clears this monitor's heartbeat.
+    looking wakeable. A dlb-mcp upgrade on disk (installed version no longer
+    matches the loaded one) returns EXIT_VERSION_CHANGED (75) so the supervised
+    wrapper can respawn on the new code. Every exit clears this monitor's
+    heartbeat.
     """
     session_id = _session_id()
     db_path = store.store_path()
@@ -336,6 +340,17 @@ def run(
                 if os.getppid() != start_ppid:
                     print("dlb-monitor: stopping (parent process exited)", file=sys.stderr)
                     return 0
+                stale = _version.stale_version()
+                if stale is not None:
+                    # The package on disk was upgraded under us. Exit with a
+                    # distinct code so the supervised wrapper respawns us at
+                    # once on the new code; `finally` clears the heartbeat.
+                    print(
+                        f"dlb-monitor: stopping (dlb-mcp upgraded {stale[0]} -> "
+                        f"{stale[1]}; exit {_version.EXIT_VERSION_CHANGED} for respawn)",
+                        file=sys.stderr,
+                    )
+                    return _version.EXIT_VERSION_CHANGED
                 seen_max_id = _poll_iteration(
                     db_path,
                     name,
