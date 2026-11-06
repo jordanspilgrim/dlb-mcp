@@ -157,6 +157,8 @@ def test_full_happy_path(server: subprocess.Popen) -> None:
     assert sent["delivery"]["registered"] is True
     assert sent["delivery"]["wakeable"] is False
     assert sent["delivery"]["warning"]
+    # The server under test runs the installed code, so it is not stale.
+    assert sent["delivery"]["stale_server"] is None
     msg_id = sent["id"]
 
     # 4. Read alpha's inbox with the token, should find the message
