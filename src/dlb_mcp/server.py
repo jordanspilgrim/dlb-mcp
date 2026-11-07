@@ -17,6 +17,12 @@ from mcp.server.fastmcp import FastMCP
 
 from . import _version, store
 
+# Name of the entry list_threads appends when this server is older than the
+# dlb-mcp installed on disk. The entry carries a "stale_server" key and none of
+# the usual agent fields, and register refuses the name, so callers can tell it
+# apart from a real agent.
+STALE_SERVER_SENTINEL = store.STALE_SERVER_SENTINEL
+
 mcp = FastMCP(
     name="dlb",
     instructions=(
@@ -359,6 +365,11 @@ def list_threads(
         working_on_chars: Truncate each `working_on` to this many chars
             (append …). Pass 0 to omit `working_on` entirely for the leanest
             roster; a large value to get full text. Default 140.
+
+    Stale server (v0.7.3+): if this session's dlb-mcp server is older than the
+    dlb-mcp installed on disk, the list ends with one extra entry,
+    {"name": "__dlb_server__", "stale_server": "<notice>"}. It is not an agent;
+    it tells you to restart the session to load the new version.
     """
     # Clamp to a sane range so a pathological JSON int can't overflow timedelta
     # (which raised a raw OverflowError). 10^7 hours ≈ 1141 years.
@@ -376,6 +387,9 @@ def list_threads(
         if omit_working_on:
             d.pop("working_on", None)
         out.append(d)
+    notice = _version.stale_server_notice()
+    if notice is not None:
+        out.append({"name": STALE_SERVER_SENTINEL, "stale_server": notice})
     return out
 
 

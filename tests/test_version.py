@@ -88,3 +88,44 @@ def test_monitor_keeps_running_when_version_unchanged(
     )
     assert exit_code == 0
     assert len(calls) == 3
+
+
+# --- list_threads stale-server sentinel ------------------------------------
+
+
+def test_list_threads_appends_sentinel_when_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    from dlb_mcp import server
+
+    server.register("a")
+    monkeypatch.setattr(_version, "installed_version", lambda: "9.9.9")
+    out = server.list_threads()
+    assert out[-1]["name"] == server.STALE_SERVER_SENTINEL
+    assert "Restart the session" in out[-1]["stale_server"]
+    assert any(e.get("name") == "a" for e in out[:-1])
+
+
+def test_list_threads_no_sentinel_when_current() -> None:
+    from dlb_mcp import server
+
+    server.register("a")
+    out = server.list_threads()
+    assert all("stale_server" not in e for e in out)
+
+
+def test_register_rejects_reserved_sentinel_name() -> None:
+    from dlb_mcp import server
+
+    with pytest.raises(store.DLBError, match="reserved"):
+        store.register(store.STALE_SERVER_SENTINEL)
+    with pytest.raises(store.DLBError, match="reserved"):
+        server.register(server.STALE_SERVER_SENTINEL)
+    assert server.list_threads() == []
+
+
+def test_list_threads_sentinel_survives_only_unread(monkeypatch: pytest.MonkeyPatch) -> None:
+    from dlb_mcp import server
+
+    server.register("a")
+    monkeypatch.setattr(_version, "installed_version", lambda: "9.9.9")
+    out = server.list_threads(only_unread=True)
+    assert [e["name"] for e in out] == [server.STALE_SERVER_SENTINEL]

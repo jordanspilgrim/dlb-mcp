@@ -70,6 +70,10 @@ DEFAULT_MAX_FIELD_BYTES = 8 * 1024  # 8 KiB
 # headroom over any real coordination inbox. Set DLB_MAX_INBOX=0 to disable.
 DEFAULT_MAX_INBOX_MESSAGES = 1000
 DEFAULT_TAKEOVER_AFTER_SECONDS = 24 * 60 * 60  # 24h: matches list_threads' default stale window
+# Name of the entry list_threads appends when the running server is older than
+# the dlb-mcp installed on disk. Reserved: register refuses it, so a real agent
+# can never share the name and be mistaken for the stale-server notice.
+STALE_SERVER_SENTINEL = "__dlb_server__"
 
 SCHEMA_VERSION = 9  # v9: cancel/supersede/deadline, monitor heartbeat, receipt opt-out, claims
 # Oldest schema a reader may support and still use this store safely. Stamped
@@ -1105,6 +1109,8 @@ def register(
     # chars (newline-injection) and cap the size, same as any metadata field.
     _check_field(name, "name")
     _check_field(working_on, "working_on")
+    if name == STALE_SERVER_SENTINEL:
+        raise DLBError(f"name {name!r} is reserved")
 
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
