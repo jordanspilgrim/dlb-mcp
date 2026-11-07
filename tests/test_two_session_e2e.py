@@ -158,6 +158,11 @@ def test_two_sessions_exchange_authenticated_messages(tmp_path: Path) -> None:
     the whole DLB + launcher effort was built for."""
     env = os.environ.copy()
     env["DLB_STORE"] = str(tmp_path / "shared.sqlite3")
+    # One harness session, configured the way the real MCP entry is:
+    # DLB_SESSION_ID='${CLAUDE_CODE_SESSION_ID:-}' can expand empty, so the
+    # server and the monitor must both fall back to CLAUDE_CODE_SESSION_ID.
+    env["DLB_SESSION_ID"] = ""
+    env["CLAUDE_CODE_SESSION_ID"] = "e2e-harness-session"
 
     with _mcp_session(env) as alpha_srv, _mcp_session(env) as bravo_srv:
         alpha = _call(alpha_srv, 1, "register", {"name": "alpha"})
@@ -220,6 +225,11 @@ def test_send_from_third_party_reaches_registered_inbox(tmp_path: Path) -> None:
     the target inbox. Covers the dead-letter path across processes."""
     env = os.environ.copy()
     env["DLB_STORE"] = str(tmp_path / "shared.sqlite3")
+    # One harness session, configured the way the real MCP entry is:
+    # DLB_SESSION_ID='${CLAUDE_CODE_SESSION_ID:-}' can expand empty, so the
+    # server and the monitor must both fall back to CLAUDE_CODE_SESSION_ID.
+    env["DLB_SESSION_ID"] = ""
+    env["CLAUDE_CODE_SESSION_ID"] = "e2e-harness-session"
 
     with _mcp_session(env) as alpha_srv, _mcp_session(env) as sender_srv:
         alpha = _call(alpha_srv, 1, "register", {"name": "alpha"})
@@ -270,6 +280,11 @@ def test_dlb_monitor_emits_wake_line_on_new_message(tmp_path: Path) -> None:
     contract with Monitor holds."""
     env = os.environ.copy()
     env["DLB_STORE"] = str(tmp_path / "shared.sqlite3")
+    # One harness session, configured the way the real MCP entry is:
+    # DLB_SESSION_ID='${CLAUDE_CODE_SESSION_ID:-}' can expand empty, so the
+    # server and the monitor must both fall back to CLAUDE_CODE_SESSION_ID.
+    env["DLB_SESSION_ID"] = ""
+    env["CLAUDE_CODE_SESSION_ID"] = "e2e-harness-session"
 
     # 1. Register alpha (so the DB has a v2 schema before dlb-monitor runs)
     with _mcp_session(env) as srv:
@@ -331,6 +346,11 @@ def test_dlb_monitor_ignores_pre_existing_messages(tmp_path: Path) -> None:
     already-read mail."""
     env = os.environ.copy()
     env["DLB_STORE"] = str(tmp_path / "shared.sqlite3")
+    # One harness session, configured the way the real MCP entry is:
+    # DLB_SESSION_ID='${CLAUDE_CODE_SESSION_ID:-}' can expand empty, so the
+    # server and the monitor must both fall back to CLAUDE_CODE_SESSION_ID.
+    env["DLB_SESSION_ID"] = ""
+    env["CLAUDE_CODE_SESSION_ID"] = "e2e-harness-session"
 
     # 1. Register alpha AND pre-populate the inbox before starting monitor
     with _mcp_session(env) as srv:
@@ -381,6 +401,11 @@ def test_end_to_end_two_sessions_with_monitor_wake(tmp_path: Path) -> None:
     prevents regressions from silently breaking the primary use case."""
     env = os.environ.copy()
     env["DLB_STORE"] = str(tmp_path / "shared.sqlite3")
+    # One harness session, configured the way the real MCP entry is:
+    # DLB_SESSION_ID='${CLAUDE_CODE_SESSION_ID:-}' can expand empty, so the
+    # server and the monitor must both fall back to CLAUDE_CODE_SESSION_ID.
+    env["DLB_SESSION_ID"] = ""
+    env["CLAUDE_CODE_SESSION_ID"] = "e2e-harness-session"
 
     # Register both agents in one shot so the monitor has a stable name
     with _mcp_session(env) as alpha_srv:

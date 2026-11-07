@@ -21,6 +21,14 @@ import pytest
 from dlb_mcp import monitor, store
 
 
+@pytest.fixture(autouse=True)
+def _one_harness_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Register and monitor from the same harness session, as in real use, so
+    the monitor's heartbeat is accepted. conftest strips the host's session
+    vars; without one shared id every heartbeat here would be refused."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "monitor-test-session")
+
+
 def test_format_event_truncates_long_body() -> None:
     long = "x" * 200
     line = monitor._format_event(0, "bob", None, long, preview_len=20)
