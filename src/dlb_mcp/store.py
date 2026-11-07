@@ -155,12 +155,27 @@ def wake_window_seconds() -> int:
         return DEFAULT_WAKE_WINDOW_SECONDS
 
 
+def resolve_session_id() -> str | None:
+    """The one source of harness session identity, shared by server and monitor.
+
+    DLB_SESSION_ID wins when set and non-empty; otherwise CLAUDE_CODE_SESSION_ID.
+    The fallback matters: the stock MCP config sets
+    DLB_SESSION_ID='${CLAUDE_CODE_SESSION_ID:-}', which can expand to an empty
+    string, while the monitor (launched from the same session's shell) still
+    sees CLAUDE_CODE_SESSION_ID. When the two sides resolved identity from
+    different sources, register() bound the row to None and every monitor
+    heartbeat was refused, so the name never showed as wakeable.
+    """
+    return os.environ.get("DLB_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+
+
 def current_session_id() -> str | None:
     """The harness session id for THIS dlb-mcp process (Design 1), or None.
 
-    Read server-side from DLB_SESSION_ID; the deployment wires it from whatever
-    stable per-session id the harness exposes (e.g. CLAUDE_CODE_SESSION_ID) via
-    the MCP config `env` block or a launch wrapper. Because the server reads it
+    Resolved by resolve_session_id(): DLB_SESSION_ID, falling back to
+    CLAUDE_CODE_SESSION_ID. The deployment wires DLB_SESSION_ID from whatever
+    stable per-session id the harness exposes via the MCP config `env` block or
+    a launch wrapper. Because the server reads it
     from its OWN environment, the caller (agent) never handles it: compaction
     can't lose it, and a peer can't forge it by passing an argument.
 
@@ -169,7 +184,7 @@ def current_session_id() -> str | None:
     Empty/unset → None, which never matches (recovery falls back to the
     per-process owned-set + stale-gate).
     """
-    return os.environ.get("DLB_SESSION_ID") or None
+    return resolve_session_id()
 
 
 # Control characters that must never appear in identity/metadata fields. Newlines
@@ -1145,7 +1160,7 @@ def register(
             token = mint_token()  # random; only sha256(token) is stored
             reclaim_secret = mint_token()  # rotating single-use reclaim credential
             # Bind this registration to the current harness session (Design 1).
-            # None when DLB_SESSION_ID is unset → session-id recovery inactive.
+            # None when no session id resolves → session-id recovery inactive.
             sid = current_session_id()
 
             if existing:
