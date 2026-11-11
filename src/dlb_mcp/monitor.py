@@ -33,7 +33,11 @@ Filters:
 Process model: poller plus an independent heartbeat thread. Exits on
 Ctrl-C, on a closed stdout, or when its parent process goes away, and
 clears its heartbeat on the way out. When dlb-mcp is upgraded on disk it
-exits with code 75 so a supervisor can respawn it on the new code. Messages that are cancelled,
+exits with code 75 so a supervisor can respawn it on the new code. When
+the store refuses its heartbeat, each refusal prints a stdout line (so it
+reaches the session as an event), and after HEARTBEAT_REFUSAL_LIMIT refusals
+in a row it exits with code 77, which a supervisor must treat as fatal.
+Messages that are cancelled,
 superseded, or past their deadline never produce an event. All other
 errors are logged to stderr and the loop continues; a single SQLite
 hiccup must not kill the wake source.
@@ -184,16 +188,29 @@ def _fetch_new(
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
-def _heartbeat(name: str, token: str | None = None, session_id: str | None = None) -> None:
-    """Record a monitor heartbeat. Never raises: a failed beat only means
-    senders briefly see `wakeable=False`, which must not kill the wake source.
+# Consecutive refused heartbeats before the monitor gives up. A refusal means
+# the store does not accept this monitor as the name's owner (wrong session id,
+# no token, or the name was reclaimed by another session), so retrying forever
+# would leave the name silently unwakeable.
+HEARTBEAT_REFUSAL_LIMIT = 3
 
-    Auth: the store accepts either the name's session_token or a matching
-    session id (see store._heartbeat_auth)."""
+
+def _heartbeat(name: str, token: str | None = None, session_id: str | None = None) -> str:
+    """Record a monitor heartbeat. Never raises.
+
+    Returns "ok", "refused" (the store rejected our credentials) or "error"
+    (anything else, e.g. a transient SQLite hiccup). Auth: the store accepts
+    either the name's session_token or a matching session id (see
+    store._heartbeat_auth)."""
     try:
         store.record_monitor_heartbeat(name, token, session_id=session_id)
+        return "ok"
+    except store.AuthError as e:
+        print(f"dlb-monitor: warning: heartbeat refused: {e}", file=sys.stderr)
+        return "refused"
     except Exception as e:
         print(f"dlb-monitor: warning: heartbeat failed: {e}", file=sys.stderr)
+        return "error"
 
 
 def _clear_heartbeat(name: str, token: str | None = None, session_id: str | None = None) -> None:
@@ -222,20 +239,48 @@ class _HeartbeatThread(threading.Thread):
         self._session_id = session_id
         self._interval = interval
         self.stop = threading.Event()
+        # Set once HEARTBEAT_REFUSAL_LIMIT beats in a row were refused; the
+        # poll loop then exits with EXIT_HEARTBEAT_REFUSED.
+        self.refused = threading.Event()
 
     def run(self) -> None:
+        refusals = 0
         while not self.stop.is_set():
-            _heartbeat(self._dlb_name, self._token, self._session_id)
+            result = _heartbeat(self._dlb_name, self._token, self._session_id)
+            if result == "refused":
+                refusals += 1
+                # stdout on purpose: a refusal makes the name unwakeable, so it
+                # must reach the session as a Monitor event, not hide in stderr.
+                print(
+                    f"dlb-monitor: heartbeat refused for {self._dlb_name} "
+                    f"({refusals}/{HEARTBEAT_REFUSAL_LIMIT}): this monitor is not "
+                    f"authenticated as the name's owner, so senders see it as not "
+                    f"wakeable",
+                    flush=True,
+                )
+                if refusals >= HEARTBEAT_REFUSAL_LIMIT:
+                    self.refused.set()
+                    return
+            elif result == "ok":
+                refusals = 0
             self.stop.wait(self._interval)
 
 
 def _session_id() -> str | None:
-    """The session id to authenticate heartbeats with. A monitor launched by
-    Claude Code inherits CLAUDE_CODE_SESSION_ID but not necessarily
-    DLB_SESSION_ID, so fall back to it; session-based heartbeat auth then works
-    without the monitor ever holding a token. Read-only: the process env is not
-    modified."""
-    return os.environ.get("DLB_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+    """The session id to authenticate heartbeats with. Delegates to
+    store.resolve_session_id(), the same resolver the server binds at register
+    time, so the two can never disagree (an empty DLB_SESSION_ID falls back to
+    CLAUDE_CODE_SESSION_ID on both sides). Read-only: the env is not modified."""
+    return store.resolve_session_id()
+
+
+def _refused_exit(name: str) -> int:
+    print(
+        f"dlb-monitor: stopping (heartbeat refused {HEARTBEAT_REFUSAL_LIMIT} times "
+        f"for '{name}'; exit {_version.EXIT_HEARTBEAT_REFUSED}, do not respawn)",
+        file=sys.stderr,
+    )
+    return _version.EXIT_HEARTBEAT_REFUSED
 
 
 def _poll_iteration(
@@ -301,8 +346,9 @@ def run(
     reparented) both end the loop, so an orphaned monitor can't keep the name
     looking wakeable. A dlb-mcp upgrade on disk (installed version no longer
     matches the loaded one) returns EXIT_VERSION_CHANGED (75) so the supervised
-    wrapper can respawn on the new code. Every exit clears this monitor's
-    heartbeat.
+    wrapper can respawn on the new code. HEARTBEAT_REFUSAL_LIMIT refused
+    heartbeats in a row return EXIT_HEARTBEAT_REFUSED (77), which the wrapper
+    treats as fatal. Every exit clears this monitor's heartbeat.
     """
     session_id = _session_id()
     db_path = store.store_path()
@@ -340,6 +386,8 @@ def run(
                 if os.getppid() != start_ppid:
                     print("dlb-monitor: stopping (parent process exited)", file=sys.stderr)
                     return 0
+                if beater.refused.is_set():
+                    return _refused_exit(name)
                 stale = _version.stale_version()
                 if stale is not None:
                     # The package on disk was upgraded under us. Exit with a
@@ -361,6 +409,8 @@ def run(
                 )
                 if _wait(interval_seconds):
                     break
+                if beater.refused.is_set():
+                    return _refused_exit(name)
             except KeyboardInterrupt:
                 raise  # forwarded to the outer handler for clean exit
             except BrokenPipeError:

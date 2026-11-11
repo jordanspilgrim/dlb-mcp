@@ -26,6 +26,11 @@ DIST_NAME = "dlb-mcp"
 # argparse) and 127 (not found).
 EXIT_VERSION_CHANGED = 75
 
+# Distinct exit code (EX_NOPERM) for "the store keeps refusing this monitor's
+# heartbeat": the monitor cannot authenticate as the name, so respawning it
+# would only fail the same way. The supervised wrapper treats it as fatal.
+EXIT_HEARTBEAT_REFUSED = 77
+
 
 def installed_version() -> str | None:
     """Return the version currently installed on disk, or None if unknown.
