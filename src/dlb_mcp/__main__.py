@@ -1,21 +1,24 @@
 """Entry point: ``dlb-mcp`` or ``python -m dlb_mcp``.
 
 Subcommands:
-  (none)   run the stdio MCP server (the default; what your MCP client invokes)
+  (none)   run the stdio MCP server behind the upgrade proxy (the default; what
+           your MCP client invokes). DLB_PROXY=0 runs the server directly.
+  worker   run the server itself; the proxy starts this (not meant for clients)
   setup    wire the recovery + inbox-check hooks into ~/.claude/settings.json
 """
 
 from __future__ import annotations
 
+import os
 import sys
-
-from .server import serve_stdio
 
 _HELP = (
     "dlb-mcp: Dead Letter Box MCP server (stdio transport).\n"
     "\n"
     "Usage:\n"
     "  dlb-mcp            Run the MCP server (speaks MCP over stdin/stdout).\n"
+    "                     It runs behind a small proxy that switches to a newly\n"
+    "                     installed dlb-mcp without a session restart.\n"
     "  dlb-mcp setup      Wire the SessionStart recovery hook and the\n"
     "                     SessionStart/UserPromptSubmit inbox-check hooks into\n"
     "                     ~/.claude/settings.json (idempotent).\n"
@@ -29,6 +32,8 @@ _HELP = (
     "  DLB_MAX_INBOX          Per-recipient inbox cap, drop-oldest (default 1000; 0=off)\n"
     "  DLB_WAKE_WINDOW_SECONDS  Max dlb-monitor heartbeat age that still counts\n"
     "                         as wakeable (default 120)\n"
+    "  DLB_PROXY             0 to run the server without the upgrade proxy\n"
+    "                         (upgrades then need a session restart)\n"
     "  DLB_SESSION_ID        Per-session id for recover_token identity (unset=off).\n"
     "                         Wire from the harness session id (e.g.\n"
     "                         CLAUDE_CODE_SESSION_ID); must be unique per session.\n"
@@ -45,7 +50,14 @@ def main() -> None:
 
         setup_main()
         return
-    serve_stdio()
+    if arg == "worker" or os.environ.get("DLB_PROXY", "1") == "0":
+        from .server import serve_stdio
+
+        serve_stdio()
+        return
+    from .proxy import main as proxy_main
+
+    proxy_main()
 
 
 if __name__ == "__main__":

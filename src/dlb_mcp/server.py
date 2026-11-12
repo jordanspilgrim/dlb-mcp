@@ -9,13 +9,17 @@ here exist only to:
 
 from __future__ import annotations
 
+import json
+import os
+import threading
 import time
 from datetime import timedelta
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from . import _version, store
+from . import __version__, _version, store
+from ._control import CONTROL_FDS_ENV, CONTROL_PROTOCOL
 
 # Name of the entry list_threads appends when this server is older than the
 # dlb-mcp installed on disk. The entry carries a "stale_server" key and none of
@@ -166,10 +170,100 @@ _owned_tokens: dict[str, str] = {}
 
 def _mark_owned(name: str, token: str) -> None:
     _owned_tokens[name] = token
+    _push_owned()
+
+
+def _unmark_owned(name: str) -> None:
+    if _owned_tokens.pop(name, None) is not None:
+        _push_owned()
 
 
 def _owns(name: str) -> bool:
     return name in _owned_tokens
+
+
+# ── Proxy control channel (worker side) ──────────────────────────────────────
+#
+# Behind the proxy (proxy.py) this process is a worker. The proxy may replace
+# it with a worker on newer code at any time, and _owned_tokens must survive
+# that, or recover_token would refuse the session its own name after every
+# upgrade. The map travels only over a private pipe pair the proxy creates and
+# passes by fd number in DLB_CONTROL_FDS ("<read>,<write>"). It never goes
+# through the MCP stream (which the model can drive), env values, argv or disk.
+#
+# Proxy -> worker, one JSON object per line:
+#   first line   {"v": 1, "owned": {name: token}, "notice": str|null}  (seed)
+#   later        {"op": "dump"}             -> reply {"op": "dump", "owned": {...}}
+#                {"op": "stale", "notice": str|null}
+# Worker -> proxy:
+#   after seed   {"op": "hello", "v": 1, "version": "<loaded version>"}
+#   on change    {"op": "owned", "owned": {...}}   (snapshot for crash respawn)
+
+_control_out: Any = None
+_control_lock = threading.Lock()
+
+
+def _control_send(obj: dict[str, Any]) -> None:
+    if _control_out is None:
+        return
+    with _control_lock:
+        try:
+            _control_out.write((json.dumps(obj) + "\n").encode())
+            _control_out.flush()
+        except (OSError, ValueError):
+            pass  # proxy gone; we exit on stdin EOF anyway
+
+
+def _push_owned() -> None:
+    _control_send({"op": "owned", "owned": dict(_owned_tokens)})
+
+
+def _control_loop(ctl_in: Any) -> None:
+    for raw in ctl_in:
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(msg, dict):
+            continue
+        op = msg.get("op")
+        if op == "dump":
+            _control_send({"op": "dump", "owned": dict(_owned_tokens)})
+        elif op == "stale":
+            notice = msg.get("notice")
+            _version.set_proxied(notice if isinstance(notice, str) else None)
+
+
+def start_control_channel() -> bool:
+    """Attach to the proxy's control pipes if DLB_CONTROL_FDS is set.
+
+    Reads the seed (owned tokens handed over from the previous worker), says
+    hello, and starts answering the proxy. Returns False when not proxied.
+    """
+    global _control_out
+    spec = os.environ.pop(CONTROL_FDS_ENV, None)
+    if not spec:
+        return False
+    read_fd, write_fd = (int(x) for x in spec.split(","))
+    ctl_in = os.fdopen(read_fd, "rb")
+    _control_out = os.fdopen(write_fd, "wb")
+    try:
+        seed = json.loads(ctl_in.readline() or b"{}")
+    except ValueError:
+        seed = {}
+    notice = None
+    if isinstance(seed, dict) and seed.get("v") == CONTROL_PROTOCOL:
+        owned = seed.get("owned")
+        if isinstance(owned, dict):
+            for k, v in owned.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    _owned_tokens[k] = v
+        n = seed.get("notice")
+        notice = n if isinstance(n, str) else None
+    _version.set_proxied(notice)
+    _control_send({"op": "hello", "v": CONTROL_PROTOCOL, "version": __version__})
+    threading.Thread(target=_control_loop, args=(ctl_in,), daemon=True).start()
+    return True
 
 
 def _reset_owned_names_for_tests() -> None:
@@ -582,7 +676,7 @@ def unregister(name: str, session_token: str) -> dict[str, Any]:
     """
     ok = store.unregister(name, session_token)
     if ok:
-        _owned_tokens.pop(name, None)  # released → this session no longer owns it
+        _unmark_owned(name)  # released → this session no longer owns it
     return {"ok": ok, "name": name}
 
 
@@ -739,5 +833,9 @@ def set_receipts(name: str, session_token: str, enabled: bool) -> dict[str, Any]
 
 
 def serve_stdio() -> None:
-    """Run the MCP server over stdio. Used by Claude Code / Cursor / Codex."""
+    """Run the MCP server over stdio. Used by Claude Code / Cursor / Codex.
+
+    Behind the proxy this is the worker; it attaches to the control pipes first.
+    """
+    start_control_channel()
     mcp.run("stdio")

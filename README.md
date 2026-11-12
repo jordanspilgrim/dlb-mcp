@@ -195,6 +195,15 @@ uvx dlb-launcher --name alpha claude      # or codex, or gemini
 
 The two are complementary: `dlb-monitor` is the cleanest fit for Claude Code, `dlb-launcher` covers anything you can wrap in a PTY.
 
+## Upgrades without a restart
+
+Install a newer dlb-mcp (`uv tool upgrade dlb-mcp`) and running sessions pick it up on their own:
+
+- **The server.** `dlb-mcp` is a small proxy that forwards MCP traffic to a worker process running the real server. Before a tool call, it checks for a newer install (at most every 5 seconds). If it finds one, it lets the old worker finish the calls it has, starts a worker on the new code, replays the client's `initialize`, and switches over. The client sees one `notifications/tools/list_changed` and nothing else: no call is dropped or sent twice, and the session keeps its identity, so `recover_token` still returns your token. The proxy lives and dies with its session; it is not a daemon.
+- **The monitor.** `dlb-monitor` exits with code 75 when it sees a newer install, and the supervised wrapper respawns it on the new code at once.
+
+If the new worker fails to start, or speaks a different handoff protocol, the proxy keeps the old worker serving and tells the session to restart: `list_threads` ends with a `__dlb_server__` entry and `send` returns `delivery.stale_server`. That is the only case that still needs a restart. `DLB_PROXY=0` runs the server without the proxy, as before; upgrades then need a restart, and the same notice says so.
+
 ## Configuration
 
 | Env var | Default | What |
@@ -206,6 +215,7 @@ The two are complementary: `dlb-monitor` is the cleanest fit for Claude Code, `d
 | `DLB_TAKEOVER_AFTER_SECONDS` | `86400` (24h) | How long a holder must be silent before `force=True` without `prior_token` can evict them |
 | `DLB_SESSION_ID` | *(harness-set)* | Stable per-session id used by `recover_token` to re-grant a token to the same session after an MCP-server respawn |
 | `DLB_WAKE_WINDOW_SECONDS` | `120` | Max age of a `dlb-monitor` heartbeat that still counts as `wakeable` |
+| `DLB_PROXY` | `1` | `0` runs the server without the upgrade proxy (upgrades then need a session restart) |
 | `DLB_MONITOR_INTERVAL` | `2.0` | Default poll interval for `dlb-monitor` (overridable via `--interval`) |
 
 ## Trust model: coordination, not confidentiality
@@ -216,6 +226,7 @@ DLB is for **cooperating agents under the same OS user**, not against adversaria
 - **Same-OS-user is the boundary.** Any process running as your user can open the store and read bodies, or drop messages into any inbox. DLB raises the bar against *accidental* cross-talk and casual spoofing; it is not a defense against a hostile local process. That is out of scope by design.
 - **Send provenance is opt-in.** Tokenless `send` keeps an unverified free-text `from_`. Passing `session_token` binds `from_` to the token's name, so a claim of "from X" is either authenticated or anonymous, never spoofed as X.
 - **`force=True` name takeover is stale-gated.** Without a matching `prior_token` (the single-use, rotating reclaim secret) or a holder idle past `DLB_TAKEOVER_AFTER_SECONDS`, takeover is rejected, which closes the casual-hijack hole.
+- **Upgrades reach live sessions.** Behind the proxy, code written into the dlb-mcp install runs in every live session at its next tool call, instead of at its next restart. That is the same same-user boundary as above (and as the monitor's exit-75 respawn). The proxy starts the worker from its own interpreter in isolated mode (`python -I`), so neither `PATH` nor a `dlb_mcp` directory in the session's working directory can stand in for it. Owned tokens move between workers only over private pipes the proxy creates, never through the MCP stream, environment, arguments or disk.
 - **No TLS, no accounts, no cross-host.** If you need a real adversarial boundary between agent sessions, you want a broker-process design (which DLB rejects, since it would break the "no daemon" promise) or a different tool entirely.
 
 ### Security hardening
