@@ -3,4 +3,4 @@
 Fifteen tools, no daemon, real dead-letter semantics + task lifecycle. See README.md.
 """
 
-__version__ = "0.7.4"
+__version__ = "0.8.0"
