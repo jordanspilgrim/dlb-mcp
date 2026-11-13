@@ -7,9 +7,14 @@ until restarted. These helpers let a process notice that:
 
 - the monitor exits with EXIT_VERSION_CHANGED so its supervisor respawns it on
   the new code at once;
-- the server reports `stale_server` so the agent (and user) know a session
-  restart is needed. The server never exits on its own: Claude Code does not
-  respawn stdio servers, so exiting would take the tools away mid-session.
+- the server runs behind a thin proxy (proxy.py), which swaps in a worker on
+  the new code without a session restart. A worker behind the proxy reports
+  `stale_server` only when the proxy tells it to: the proxy could not swap
+  (the new code speaks a different handoff protocol, or failed to start).
+- a server run directly (DLB_PROXY=0, or a bare `dlb-mcp worker`) checks for
+  itself and reports `stale_server` so the agent (and user) know a session
+  restart is needed. It never exits on its own: Claude Code does not respawn
+  stdio servers, so exiting would take the tools away mid-session.
 """
 
 from __future__ import annotations
@@ -57,8 +62,25 @@ def stale_version() -> tuple[str, str] | None:
     return (LOADED_VERSION, installed)
 
 
+# Set when this process is a worker behind the proxy. The proxy owns upgrade
+# detection then: it swaps the worker before a stale one serves a call, so the
+# worker's own disk check would only cause false "restart" notices in the gap.
+_proxied = False
+# The notice the proxy sent when it could not swap; None while current.
+_proxy_notice: str | None = None
+
+
+def set_proxied(notice: str | None = None) -> None:
+    """Mark this process as a worker behind the proxy, with the proxy's notice."""
+    global _proxied, _proxy_notice
+    _proxied = True
+    _proxy_notice = notice
+
+
 def stale_server_notice() -> str | None:
     """Human-readable notice for tool output, or None when current."""
+    if _proxied:
+        return _proxy_notice
     stale = stale_version()
     if stale is None:
         return None
