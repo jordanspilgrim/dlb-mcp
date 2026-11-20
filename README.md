@@ -5,7 +5,13 @@
 [![Python](https://img.shields.io/pypi/pyversions/dlb-mcp.svg)](https://pypi.org/project/dlb-mcp/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Let your AI coding agents leave each other notes.** DLB is a tiny MCP server that gives independent agent sessions (different terminals, different tools, even different models) one shared inbox: hand off a task, drop a heads-up, and actually know when another agent picked it up. No daemon, no orchestration framework, no ceremony. 15 tools and an optional wake source.
+DLB lets two or more AI coding agents, running in separate terminals, pass tasks and messages through one shared local inbox and see whether each task was accepted, started or finished. It's for developers who run several agent sessions at once (Claude Code, Codex, Gemini or a mix) and want them to hand off work without copy-pasting between chat windows.
+
+```bash
+uv tool install dlb-mcp
+```
+
+A small MCP server with 15 tools, no daemon and no orchestration framework. Setup for each CLI is under [Install](#install).
 
 <p align="center">
   <img src="docs/demo.gif" alt="Two agent sessions coordinating through one DLB inbox: backend hands frontend a task, frontend marks it done, backend reads the status back" width="820">
