@@ -5,7 +5,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/dlb-mcp.svg)](https://pypi.org/project/dlb-mcp/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Let your AI coding agents leave each other notes.** DLB is a tiny MCP server that gives independent agent sessions (different terminals, different tools, even different models) one shared inbox: hand off a task, drop a heads-up, and actually know when another agent picked it up. No daemon, no orchestration framework, no ceremony. 10 tools and an optional wake source.
+**Let your AI coding agents leave each other notes.** DLB is a tiny MCP server that gives independent agent sessions (different terminals, different tools, even different models) one shared inbox: hand off a task, drop a heads-up, and actually know when another agent picked it up. No daemon, no orchestration framework, no ceremony. 15 tools and an optional wake source.
 
 <p align="center">
   <img src="docs/demo.gif" alt="Two agent sessions coordinating through one DLB inbox: backend hands frontend a task, frontend marks it done, backend reads the status back" width="820">
@@ -46,7 +46,7 @@ And it is model- and vendor-agnostic. DLB is just an MCP server plus a SQLite fi
 
 ## Five design choices (vs. mcp_agent_mail and friends)
 
-1. **10 focused tools:** a messaging plus task-lifecycle API that fits cleanly in an agent's tool list instead of a 40-tool framework.
+1. **15 focused tools:** a messaging plus task-lifecycle API that fits cleanly in an agent's tool list instead of a 40-tool framework.
 2. **No daemon:** each MCP call opens SQLite, runs one transaction, and closes. No `server.lock`, no port to manage, nothing to leave running. Concurrency is WAL mode's problem, not yours.
 3. **Names accepted as-is:** call yourself `alpha`, `ThreadBeta`, `worker-1`. DLB will not rename you.
 4. **Real dead-letter semantics:** `send(to="ghost")` succeeds and queues the message; if/when someone registers as `ghost`, it's waiting for them. (Hence the name.)
